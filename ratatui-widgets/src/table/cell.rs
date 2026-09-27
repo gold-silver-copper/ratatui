@@ -177,6 +177,11 @@ impl<'a> Cell<'a> {
 
 impl Cell<'_> {
     pub(crate) fn render(&self, area: Rect, buf: &mut Buffer) {
+        // Cells of rows that don't fit in the table (e.g. because of a top margin) get an empty
+        // area which may be outside of the table, so these aren't rendered at all.
+        if area.is_empty() {
+            return;
+        }
         buf.set_style(area, self.style);
         Widget::render(&self.content, area, buf);
     }
