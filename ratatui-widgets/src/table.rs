@@ -892,8 +892,15 @@ impl Table<'_> {
             .skip(start_index)
             .take(end_index - start_index)
         {
-            let y = area.y + y_offset + row.top_margin;
-            let height = (y + row.height).min(area.bottom()).saturating_sub(y);
+            // saturating, as rows can extend past the end of the coordinate space
+            let y = area
+                .y
+                .saturating_add(y_offset)
+                .saturating_add(row.top_margin);
+            let height = y
+                .saturating_add(row.height)
+                .min(area.bottom())
+                .saturating_sub(y);
             let row_area = Rect { y, height, ..area };
             buf.set_style(row_area, row.style);
 
@@ -905,7 +912,7 @@ impl Table<'_> {
             if is_selected {
                 selected_row_area = Some(row_area);
             }
-            y_offset += row.height_with_margin();
+            y_offset = y_offset.saturating_add(row.height_with_margin());
         }
 
         let selected_column_area = state.selected_column.and_then(|s| {
@@ -955,7 +962,10 @@ impl Table<'_> {
                 self.column_spacing,
             ) {
                 let new_x = row_area.x + cell_area.x;
-                let area_to_render = Rect::new(new_x, row_area.y, cell_area.width, row_area.height);
+                // A cell spanning multiple columns can extend past the right edge of the table
+                // when the columns are squeezed, so it is clipped to the row
+                let area_to_render = Rect::new(new_x, row_area.y, cell_area.width, row_area.height)
+                    .intersection(row_area);
                 current_cell.render(area_to_render, buf);
             }
         }
@@ -969,10 +979,12 @@ impl Table<'_> {
         row_area: Rect,
         row: &Row,
     ) {
+        // clipped to the row, in case the highlight symbol is wider than the table
         let selection_area = Rect {
             width: selection_width,
             ..row_area
-        };
+        }
+        .intersection(row_area);
         buf.set_style(selection_area, row.style);
         (&self.highlight_symbol).render(selection_area, buf);
     }
@@ -1004,11 +1016,13 @@ impl Table<'_> {
         let first = column_widths_iterator.next()?;
         let (n_columns_taken, all_columns_width) = column_widths_iterator
             .take((cell_column_span - 1).into())
-            .map(|rect| (1, rect.width))
-            .fold((1, first.width), |so_far, next_column| {
+            .map(|rect| (1, u32::from(rect.width)))
+            .fold((1, u32::from(first.width)), |so_far, next_column| {
                 (next_column.0 + so_far.0, next_column.1 + so_far.1)
             });
-        let width = all_columns_width + (n_columns_taken - 1) * column_spacing;
+        // computed as u32 and clamped, as a large column spacing can overflow u16
+        let width = all_columns_width + (n_columns_taken - 1) * u32::from(column_spacing);
+        let width = u16::try_from(width).unwrap_or(u16::MAX);
         Some(Rect::new(first.x, first.y, width, 1))
     }
 
@@ -1032,13 +1046,13 @@ impl Table<'_> {
         }
 
         let mut end = start;
-        let mut height = 0;
+        let mut height: u16 = 0;
 
         for item in self.rows.iter().skip(start) {
-            if height + item.height > area.height {
+            if height.saturating_add(item.height) > area.height {
                 break;
             }
-            height += item.height_with_margin();
+            height = height.saturating_add(item.height_with_margin());
             end += 1;
         }
 
@@ -3043,5 +3057,66 @@ mod tests {
             StatefulWidget::render(table, buf.area, &mut buf, &mut state);
             assert_eq!(buf, Buffer::with_lines(expected));
         }
+    }
+
+    #[test]
+    fn tall_rows_do_not_overflow() {
+        // a row taller than the space left in the coordinate space
+        let table = Table::new([Row::new(["a"]).height(u16::MAX)], [Constraint::Length(1)]);
+        let mut buf = Buffer::empty(Rect::new(0, 1, 5, 5));
+        Widget::render(table, buf.area, &mut buf);
+
+        // rows whose heights add up to more than u16::MAX
+        let rows = [Row::new(["a"]).height(3), Row::new(["b"]).height(u16::MAX)];
+        let table = Table::new(rows, [Constraint::Length(1)]);
+        let mut buf = Buffer::empty(Rect::new(0, 0, 5, 5));
+        Widget::render(table, buf.area, &mut buf);
+    }
+
+    #[test]
+    fn column_span_with_large_spacing_does_not_overflow() {
+        let rows = [Row::new([Cell::from("a").column_span(3)])];
+        let table = Table::new(rows, [Constraint::Length(1); 3]).column_spacing(u16::MAX);
+        let mut buf = Buffer::empty(Rect::new(0, 0, 5, 1));
+        Widget::render(table, buf.area, &mut buf);
+    }
+
+    /// Renders into the top left 4x1 of a 10x3 buffer, to check nothing is drawn outside the table
+    fn render_narrow(table: Table, state: &mut TableState) -> Buffer {
+        let mut buf = Buffer::filled(Rect::new(0, 0, 10, 3), ratatui_core::buffer::Cell::new("."));
+        StatefulWidget::render(table, Rect::new(0, 0, 4, 1), &mut buf, state);
+        buf
+    }
+
+    #[test]
+    fn wide_highlight_symbol_is_clipped_to_table() {
+        let table =
+            Table::new([Row::new(["a"])], [Constraint::Length(1)]).highlight_symbol(">>>>>>");
+        let buf = render_narrow(table, &mut TableState::new().with_selected(Some(0)));
+        assert_eq!(
+            buf,
+            Buffer::with_lines([">>>>......", "..........", ".........."])
+        );
+    }
+
+    #[test]
+    fn spanning_cell_is_clipped_to_table() {
+        let rows = [Row::new([Cell::from("abcdefghij").column_span(3)])];
+        let table = Table::new(rows, [Constraint::Length(3); 3]).column_spacing(3);
+        let buf = render_narrow(table, &mut TableState::new());
+        assert_eq!(
+            buf,
+            Buffer::with_lines(["abcd......", "..........", ".........."])
+        );
+    }
+
+    #[test]
+    fn row_pushed_out_by_margin_is_not_rendered() {
+        // The row's top margin pushes it below the table, so its cell gets an empty area outside
+        // of the table, which must not be rendered to
+        let rows = [Row::new([Cell::from("x").style(Style::new().red())]).top_margin(2)];
+        let table = Table::new(rows, [Constraint::Length(4)]);
+        let buf = render_narrow(table, &mut TableState::new());
+        assert_eq!(buf, Buffer::with_lines([".........."; 3]));
     }
 }
