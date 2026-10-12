@@ -55,11 +55,13 @@ fn drip(frame_count: usize, area: Rect, buf: &mut Buffer) {
                 .clamp(area.left(), area.right() - 1);
             let dest_y = area.top() + 1;
 
-            let dest = &mut buf[(dest_x, dest_y)];
+            let Some(mut dest) = buf.cell_mut((dest_x, dest_y)) else {
+                continue;
+            };
             // copy the cell to the new location about 1/10 of the time blank out the cell the rest
             // of the time. This has the effect of gradually removing the pixels from the screen.
             if rng.random_ratio(1, 10) {
-                *dest = src;
+                dest.set_cell(&src);
             } else {
                 dest.reset();
             }
@@ -68,7 +70,9 @@ fn drip(frame_count: usize, area: Rect, buf: &mut Buffer) {
             let dest_x = src_x;
             let dest_y = src_y.saturating_add(1).min(area.bottom() - 2);
             // copy the cell to the new location
-            buf[(dest_x, dest_y)] = src;
+            if let Some(mut dest) = buf.cell_mut((dest_x, dest_y)) {
+                dest.set_cell(&src);
+            }
         }
     }
 }
@@ -98,8 +102,10 @@ fn text(frame_count: usize, area: Rect, buf: &mut Buffer) {
 
     for row in area.rows() {
         for col in row.columns() {
-            let cell = &mut buf[(col.x, col.y)];
-            let mask_cell = &mut mask_buf[(col.x, col.y)];
+            let mask_cell = &mask_buf[(col.x, col.y)];
+            let Some(mut cell) = buf.cell_mut((col.x, col.y)) else {
+                continue;
+            };
             cell.set_symbol(mask_cell.symbol());
 
             // blend the mask cell color with the cell color

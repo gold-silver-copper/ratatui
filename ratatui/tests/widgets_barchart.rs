@@ -81,11 +81,11 @@ fn widgets_barchart_group() {
     ]);
     for y in 1..(TERMINAL_HEIGHT - 3) {
         for x in 1..5 {
-            expected[(x, y)].set_fg(Color::Red);
-            expected[(x + 5, y)].set_fg(Color::Green);
+            expected.cell_mut((x, y)).unwrap().set_fg(Color::Red);
+            expected.cell_mut((x + 5, y)).unwrap().set_fg(Color::Green);
         }
     }
-    expected[(2, 7)].set_fg(Color::Blue);
-    expected[(3, 7)].set_fg(Color::Blue);
+    expected.cell_mut((2, 7)).unwrap().set_fg(Color::Blue);
+    expected.cell_mut((3, 7)).unwrap().set_fg(Color::Blue);
     terminal.backend().assert_buffer(&expected);
 }

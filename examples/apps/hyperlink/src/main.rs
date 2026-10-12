@@ -66,7 +66,9 @@ impl Widget for &Hyperlink<'_> {
         {
             let text = two_chars.collect::<String>();
             let hyperlink = format!("\x1B]8;;{}\x07{}\x1B]8;;\x07", self.url, text);
-            buffer[(area.x + i as u16 * 2, area.y)].set_symbol(hyperlink.as_str());
+            if let Some(mut cell) = buffer.cell_mut((area.x + i as u16 * 2, area.y)) {
+                cell.set_symbol(hyperlink.as_str());
+            }
         }
     }
 }

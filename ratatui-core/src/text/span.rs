@@ -6,7 +6,7 @@ use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 
 use crate::buffer::{Buffer, CellWidth};
-use crate::layout::Rect;
+use crate::layout::{Position, Rect};
 use crate::style::{Style, Styled};
 use crate::text::{Line, StyledGrapheme};
 use crate::widgets::Widget;
@@ -439,36 +439,19 @@ impl Widget for &Span<'_> {
                 break;
             }
 
-            if i == 0 {
-                // the first grapheme is always set on the cell
-                buf[(x, y)]
-                    .set_symbol(grapheme.symbol)
-                    .set_style(grapheme.style);
+            if i == 0 || (x != area.x && symbol_width != 0) {
+                // the first grapheme is always set on the cell, and so is a normal grapheme (not
+                // first, not zero-width, not overflowing the area)
+                if let Some(mut cell) = buf.cell_mut((x, y)) {
+                    cell.set_symbol(grapheme.symbol).set_style(grapheme.style);
+                }
             } else if x == area.x {
                 // there is one or more zero-width graphemes in the first cell, so the first cell
                 // must be appended to.
-                buf[(x, y)]
-                    .append_symbol(grapheme.symbol)
-                    .set_style(grapheme.style);
-            } else if symbol_width == 0 {
-                // append zero-width graphemes to the previous cell
-                buf[(x - 1, y)]
-                    .append_symbol(grapheme.symbol)
-                    .set_style(grapheme.style);
+                buf.append_symbol(Position { x, y }, grapheme.symbol, grapheme.style);
             } else {
-                // just a normal grapheme (not first, not zero-width, not overflowing the area)
-                buf[(x, y)]
-                    .set_symbol(grapheme.symbol)
-                    .set_style(grapheme.style);
-            }
-
-            // multi-width graphemes must clear the cells of characters that are hidden by the
-            // grapheme, otherwise the hidden characters will be re-rendered if the grapheme is
-            // overwritten.
-            for x_hidden in (x + 1)..next_x {
-                // it may seem odd that the style of the hidden cells are not set to the style of
-                // the grapheme, but this is how the existing buffer.set_span() method works.
-                buf[(x_hidden, y)].reset();
+                // append zero-width graphemes to the previous glyph
+                buf.append_symbol(Position { x: x - 1, y }, grapheme.symbol, grapheme.style);
             }
             x = next_x;
         }

@@ -35,21 +35,24 @@ fn barchart_can_be_stylized() {
     for y in area.y..area.height {
         // background
         for x in area.x..area.width {
-            expected[(x, y)].set_bg(Color::White);
+            expected.cell_mut((x, y)).unwrap().set_bg(Color::White);
         }
         // bars
         for x in [0, 1, 3, 4, 6, 7] {
-            expected[(x, y)].set_fg(Color::Red);
+            expected.cell_mut((x, y)).unwrap().set_fg(Color::Red);
         }
     }
     // values
     for x in 0..3 {
-        expected[(x * 3, 3)].set_fg(Color::Green);
+        expected.cell_mut((x * 3, 3)).unwrap().set_fg(Color::Green);
     }
     // labels
     for x in 0..3 {
-        expected[(x * 3, 4)].set_fg(Color::Blue);
-        expected[(x * 3 + 1, 4)].set_fg(Color::Reset);
+        expected.cell_mut((x * 3, 4)).unwrap().set_fg(Color::Blue);
+        expected
+            .cell_mut((x * 3 + 1, 4))
+            .unwrap()
+            .set_fg(Color::Reset);
     }
     terminal.backend().assert_buffer(&expected);
 }
@@ -76,11 +79,15 @@ fn block_can_be_stylized() -> Result<(), core::convert::Infallible> {
     ]);
     for x in area.x..area.width {
         for y in area.y..area.height {
-            expected[(x, y)].set_fg(Color::Cyan).set_bg(Color::Cyan);
+            expected
+                .cell_mut((x, y))
+                .unwrap()
+                .set_fg(Color::Cyan)
+                .set_bg(Color::Cyan);
         }
     }
     for x in 1..=5 {
-        expected[(x, 0)].set_fg(Color::LightBlue);
+        expected.cell_mut((x, 0)).unwrap().set_fg(Color::LightBlue);
     }
     terminal.backend().assert_buffer(&expected);
     Ok(())
@@ -98,7 +105,7 @@ fn paragraph_can_be_stylized() -> Result<(), core::convert::Infallible> {
 
     let mut expected = Buffer::with_lines(["Text      "]);
     for x in 0..4 {
-        expected[(x, 0)].set_fg(Color::Cyan);
+        expected.cell_mut((x, 0)).unwrap().set_fg(Color::Cyan);
     }
     terminal.backend().assert_buffer(&expected);
     Ok(())

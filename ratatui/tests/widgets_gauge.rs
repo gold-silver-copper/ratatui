@@ -261,13 +261,13 @@ fn widgets_line_gauge_renders() {
         " 80% ████████████░░░",
     ]);
     for col in 5..11 {
-        expected[(col, 0)].set_fg(Color::Green);
+        expected.cell_mut((col, 0)).unwrap().set_fg(Color::Green);
     }
     for col in 11..20 {
-        expected[(col, 0)].set_fg(Color::White);
+        expected.cell_mut((col, 0)).unwrap().set_fg(Color::White);
     }
     for col in 6..8 {
-        expected[(col, 2)].set_fg(Color::Green);
+        expected.cell_mut((col, 2)).unwrap().set_fg(Color::Green);
     }
     terminal.backend().assert_buffer(&expected);
 }

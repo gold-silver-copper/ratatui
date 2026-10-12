@@ -275,7 +275,9 @@
 //!
 //! // Renders position indices (0-9 repeating) at each cell position
 //! for (i, pos) in area.positions().enumerate() {
-//!     buffer[pos].set_symbol(&format!("{}", i % 10));
+//!     if let Some(mut cell) = buffer.cell_mut(pos) {
+//!         cell.set_symbol(&format!("{}", i % 10));
+//!     }
 //! }
 //! ```
 //!

@@ -200,20 +200,22 @@ impl Gauge<'_> {
                 // Use full block for the filled part of the gauge and spaces for the part that is
                 // covered by the label. Note that the background and foreground colors are swapped
                 // for the label part, otherwise the gauge will be inverted
+                let Some(mut cell) = buf.cell_mut((x, y)) else {
+                    continue;
+                };
+                let fg = self.gauge_style.fg.unwrap_or(Color::Reset);
+                let bg = self.gauge_style.bg.unwrap_or(Color::Reset);
                 if x < label_col || x >= label_col + clamped_label_width || y != label_row {
-                    buf[(x, y)]
-                        .set_symbol(symbols::block::FULL)
-                        .set_fg(self.gauge_style.fg.unwrap_or(Color::Reset))
-                        .set_bg(self.gauge_style.bg.unwrap_or(Color::Reset));
+                    cell.set_symbol(symbols::block::FULL).set_fg(fg).set_bg(bg);
                 } else {
-                    buf[(x, y)]
-                        .set_symbol(" ")
-                        .set_fg(self.gauge_style.bg.unwrap_or(Color::Reset))
-                        .set_bg(self.gauge_style.fg.unwrap_or(Color::Reset));
+                    cell.set_symbol(" ").set_fg(bg).set_bg(fg);
                 }
             }
-            if self.use_unicode && self.ratio < 1.0 {
-                buf[(end, y)].set_symbol(get_unicode_block(filled_width % 1.0));
+            if self.use_unicode
+                && self.ratio < 1.0
+                && let Some(mut cell) = buf.cell_mut((end, y))
+            {
+                cell.set_symbol(get_unicode_block(filled_width % 1.0));
             }
         }
         // render the label
@@ -452,14 +454,16 @@ impl Widget for &LineGauge<'_> {
         let end = start
             + (f64::from(gauge_area.right().saturating_sub(start)) * self.ratio).floor() as u16;
         for col in start..end {
-            buf[(col, row)]
-                .set_symbol(self.filled_symbol)
-                .set_style(self.filled_style);
+            if let Some(mut cell) = buf.cell_mut((col, row)) {
+                cell.set_symbol(self.filled_symbol)
+                    .set_style(self.filled_style);
+            }
         }
         for col in end..gauge_area.right() {
-            buf[(col, row)]
-                .set_symbol(self.unfilled_symbol)
-                .set_style(self.unfilled_style);
+            if let Some(mut cell) = buf.cell_mut((col, row)) {
+                cell.set_symbol(self.unfilled_symbol)
+                    .set_style(self.unfilled_style);
+            }
         }
     }
 }

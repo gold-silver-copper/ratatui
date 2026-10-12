@@ -813,7 +813,7 @@ impl crate::crossterm::Command for ScrollDownInRegion {
 mod tests {
     use std::num::NonZeroU16;
 
-    use ratatui_core::buffer::{Buffer, CellDiffOption};
+    use ratatui_core::buffer::Buffer;
     use ratatui_core::layout::Rect;
     use rstest::rstest;
 
@@ -855,21 +855,25 @@ mod tests {
     fn draw_uses_forced_width_for_cursor_tracking() {
         // A cell with an escape sequence has an arbitrary text width; the forced width tells
         // us how far the terminal cursor actually advances.
-        let mut forced = Cell::new("\u{1b}[?25hab");
-        forced.set_diff_option(CellDiffOption::ForcedWidth(NonZeroU16::new(2).unwrap()));
+        let mut buffer = Buffer::empty(Rect::new(0, 0, 3, 1));
+        buffer
+            .cell_mut((0, 0))
+            .unwrap()
+            .set_symbol_with_width("\u{1b}[?25hab", NonZeroU16::new(2).unwrap());
+        let forced = &buffer[(0, 0)];
         let next = Cell::new("c");
-        let output = draw_to_string(&[(0, 0, &forced), (2, 0, &next)]);
+        let output = draw_to_string(&[(0, 0, forced), (2, 0, &next)]);
         assert!(!output.contains(&MoveTo(2, 0).to_string()));
-        let output = draw_to_string(&[(0, 0, &forced), (1, 0, &next)]);
+        let output = draw_to_string(&[(0, 0, forced), (1, 0, &next)]);
         assert!(output.contains(&MoveTo(1, 0).to_string()));
     }
 
     #[test]
     fn draw_moves_cursor_when_previous_width_overflows() {
-        let mut forced = Cell::new("a");
-        forced.set_diff_option(CellDiffOption::ForcedWidth(NonZeroU16::MAX));
+        // A wide glyph at the last representable column: its end overflows u16.
+        let wide = Cell::new("界");
         let next = Cell::new("b");
-        let output = draw_to_string(&[(1, 0, &forced), (0, 0, &next)]);
+        let output = draw_to_string(&[(u16::MAX - 1, 0, &wide), (0, 0, &next)]);
         assert!(output.contains(&MoveTo(0, 0).to_string()));
     }
 

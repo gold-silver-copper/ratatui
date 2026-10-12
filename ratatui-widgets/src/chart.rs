@@ -1024,25 +1024,27 @@ impl Widget for &Chart<'_> {
 
         if let Some(y) = layout.axis_x {
             for x in graph_area.left()..graph_area.right() {
-                buf[(x, y)]
-                    .set_symbol(symbols::line::HORIZONTAL)
-                    .set_style(self.x_axis.style);
+                if let Some(mut cell) = buf.cell_mut((x, y)) {
+                    cell.set_symbol(symbols::line::HORIZONTAL)
+                        .set_style(self.x_axis.style);
+                }
             }
         }
 
         if let Some(x) = layout.axis_y {
             for y in graph_area.top()..graph_area.bottom() {
-                buf[(x, y)]
-                    .set_symbol(symbols::line::VERTICAL)
-                    .set_style(self.y_axis.style);
+                if let Some(mut cell) = buf.cell_mut((x, y)) {
+                    cell.set_symbol(symbols::line::VERTICAL)
+                        .set_style(self.y_axis.style);
+                }
             }
         }
 
         if let Some(y) = layout.axis_x
             && let Some(x) = layout.axis_y
+            && let Some(mut cell) = buf.cell_mut((x, y))
         {
-            buf[(x, y)]
-                .set_symbol(symbols::line::BOTTOM_LEFT)
+            cell.set_symbol(symbols::line::BOTTOM_LEFT)
                 .set_style(self.x_axis.style);
         }
 

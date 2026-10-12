@@ -207,14 +207,16 @@ impl App {
         self.selected_tab.render(content_area, &mut demo_buf);
 
         let visible_content = demo_buf
-            .content
-            .into_iter()
+            .content()
+            .iter()
             .skip((demo_area.width * self.scroll_offset) as usize)
             .take(area.area() as usize);
         for (i, cell) in visible_content.enumerate() {
             let x = i as u16 % area.width;
             let y = i as u16 / area.width;
-            buf[(area.x + x, area.y + y)] = cell;
+            if let Some(mut dest) = buf.cell_mut((area.x + x, area.y + y)) {
+                dest.set_cell(cell);
+            }
         }
 
         if scrollbar_needed {

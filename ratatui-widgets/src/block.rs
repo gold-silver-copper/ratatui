@@ -872,9 +872,10 @@ impl Block<'_> {
             if self.borders.contains(border) {
                 for x in x_range {
                     for y in y_range.clone() {
-                        buf[(x, y)]
-                            .merge_symbol(symbol, self.merge_borders)
-                            .set_style(self.border_style);
+                        if let Some(mut cell) = buf.cell_mut((x, y)) {
+                            cell.merge_symbol(symbol, self.merge_borders)
+                                .set_style(self.border_style);
+                        }
                     }
                 }
             }
@@ -910,9 +911,10 @@ impl Block<'_> {
         ];
 
         for (border, x, y, symbol) in corners {
-            if self.borders.contains(border) {
-                buf[(x, y)]
-                    .merge_symbol(symbol, self.merge_borders)
+            if self.borders.contains(border)
+                && let Some(mut cell) = buf.cell_mut((x, y))
+            {
+                cell.merge_symbol(symbol, self.merge_borders)
                     .set_style(self.border_style);
             }
         }

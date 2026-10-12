@@ -262,7 +262,7 @@ mod tests {
 
         {
             let frame = terminal.get_frame();
-            frame.buffer[(1, 0)].set_symbol("x");
+            frame.buffer.cell_mut((1, 0)).unwrap().set_symbol("x");
         }
 
         terminal.flush().unwrap();
@@ -286,7 +286,10 @@ mod tests {
         let backend = TestBackend::new(3, 2);
         let mut terminal = Terminal::new(backend).unwrap();
 
-        terminal.buffers[1][(0, 0)].set_symbol("x");
+        terminal.buffers[1]
+            .cell_mut((0, 0))
+            .unwrap()
+            .set_symbol("x");
         terminal.swap_buffers();
 
         assert_eq!(terminal.current, 1);
@@ -303,12 +306,19 @@ mod tests {
 
         {
             let frame = terminal.get_frame();
-            frame.buffer[(0, 0)] = Cell::new("x");
+            frame
+                .buffer
+                .cell_mut((0, 0))
+                .unwrap()
+                .set_cell(&Cell::new("x"));
         }
         terminal.flush().unwrap();
         terminal.backend().assert_buffer_lines(["x  ", "   "]);
 
-        terminal.buffers[1][(2, 1)] = Cell::new("y");
+        terminal.buffers[1]
+            .cell_mut((2, 1))
+            .unwrap()
+            .set_cell(&Cell::new("y"));
         terminal.clear().unwrap();
 
         terminal.backend().assert_buffer_lines(["   ", "   "]);
@@ -343,7 +353,10 @@ mod tests {
             .set_cursor_position(Position { x: 2, y: 2 })
             .unwrap();
 
-        terminal.buffers[1][(2, 2)] = Cell::new("x");
+        terminal.buffers[1]
+            .cell_mut((2, 2))
+            .unwrap()
+            .set_cell(&Cell::new("x"));
         terminal.clear().unwrap();
 
         // Inline viewport is anchored to the cursor row (y = 2) with height 2. Clear runs from

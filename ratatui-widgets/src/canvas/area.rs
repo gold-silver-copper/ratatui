@@ -366,9 +366,12 @@ mod tests {
         canvas.render(buffer.area, &mut buffer);
 
         let mut expected = Buffer::with_lines(expected);
-        for cell in &mut expected.content {
-            if cell.symbol() == "•" {
-                cell.set_style(Style::new().red());
+        for position in expected.area.positions() {
+            if expected[position].symbol() == "•" {
+                expected
+                    .cell_mut(position)
+                    .unwrap()
+                    .set_style(Style::new().red());
             }
         }
         assert_eq!(buffer, expected);

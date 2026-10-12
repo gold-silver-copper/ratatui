@@ -25,11 +25,23 @@ pub enum CellDiffOption {
     /// renderer may draw over the same area, such as an external image pipeline, so Ratatui can
     /// redraw text there on the next render.
     AlwaysUpdate,
-    /// Force a width regardless of the symbol text width.
-    ///
-    /// Escape sequences will have some computed width that does match what is written to the
-    /// screen.
-    ForcedWidth(NonZeroU16),
+}
+
+/// How many columns a cell occupies.
+///
+/// Private so that only [`Buffer`](super::Buffer) can make a cell a continuation, and it does so
+/// only while writing the wide glyph to its left.
+#[derive(Debug, Default, Clone, Copy, Eq, PartialEq, Hash)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub(crate) enum Span {
+    /// As many columns as the symbol is wide.
+    #[default]
+    Symbol,
+    /// A declared number of columns, for symbols whose text width says nothing about their size
+    /// on screen (escape sequences), or for a wide glyph clipped by the right edge of the buffer.
+    Fixed(NonZeroU16),
+    /// Covered by the wide glyph anchored to the left of this cell.
+    Continuation,
 }
 
 /// A buffer cell
@@ -70,6 +82,9 @@ pub struct Cell {
         note = "use `set_diff_option(CellDiffOption::Skip)` instead"
     )]
     pub skip: bool,
+
+    /// How many columns the cell occupies, or whether it is covered by the glyph to its left.
+    span: Span,
 }
 
 impl Cell {
@@ -84,6 +99,7 @@ impl Cell {
         modifier: Modifier::empty(),
         diff_option: CellDiffOption::None,
         skip: false,
+        span: Span::Symbol,
     };
 
     /// Creates a new `Cell` with the given symbol.
@@ -101,10 +117,59 @@ impl Cell {
 
     /// Gets the symbol of the cell.
     ///
-    /// If the cell has no symbol, returns a single space character.
+    /// If the cell has no symbol, returns a single space character. A
+    /// [continuation](Self::is_continuation) cell draws nothing of its own and returns an empty
+    /// string.
     #[must_use]
     pub fn symbol(&self) -> &str {
-        self.symbol.as_ref().map_or(" ", |s| s.as_str())
+        match (&self.symbol, self.span) {
+            (_, Span::Continuation) => "",
+            (Some(symbol), _) => symbol.as_str(),
+            (None, _) => " ",
+        }
+    }
+
+    /// Returns `true` if this cell is covered by the wide glyph to its left.
+    ///
+    /// A wide glyph, such as `界` or an emoji, is stored in the cell where it starts (its
+    /// anchor); the other columns it covers hold continuation cells. They have no symbol of their
+    /// own and are never sent to the terminal: the anchor draws them. Only a [`Buffer`] write of
+    /// a wide glyph creates them, and any write to a part of the glyph removes the whole glyph,
+    /// so a continuation always follows the anchor (or another continuation) of its glyph.
+    ///
+    /// They share the style of their glyph, which draws it on all its columns. When the glyph is
+    /// overwritten, they become blank cells in that style.
+    ///
+    /// [`Buffer`]: super::Buffer
+    #[must_use]
+    pub const fn is_continuation(&self) -> bool {
+        matches!(self.span, Span::Continuation)
+    }
+
+    /// Returns how many columns the cell's glyph occupies in the buffer, at least one.
+    ///
+    /// This is [`cell_width`](CellWidth::cell_width) for a cell that draws a glyph, and one for a
+    /// continuation cell or a zero-width symbol, which still fill their column.
+    pub(crate) fn columns(&self) -> u16 {
+        self.cell_width().max(1)
+    }
+
+    /// Turns this cell into a continuation of a glyph drawn with `style`.
+    pub(crate) fn make_continuation(&mut self, style: Style) {
+        self.reset();
+        self.set_style(style);
+        self.span = Span::Continuation;
+    }
+
+    /// Turns this cell, part of a glyph that was overwritten, into a blank keeping its style.
+    pub(crate) fn make_blank(&mut self) {
+        self.symbol = None;
+        self.span = Span::Symbol;
+    }
+
+    /// Declares how many columns the cell occupies.
+    pub(crate) const fn set_span(&mut self, span: Span) {
+        self.span = span;
     }
 
     /// Merges the symbol of the cell with the one already on the cell, using the provided
@@ -150,12 +215,18 @@ impl Cell {
             .as_ref()
             .map_or(symbol, |s| strategy.merge(s, symbol));
         self.symbol = Some(CompactString::new(merged_symbol));
+        self.span = Span::Symbol;
         self
     }
 
     /// Sets the symbol of the cell.
+    ///
+    /// The cell then occupies as many columns as the symbol is wide. This changes a cell value;
+    /// to write to a [`Buffer`](super::Buffer), use [`Buffer::cell_mut`](super::Buffer::cell_mut),
+    /// which also updates the columns the symbol covers.
     pub fn set_symbol(&mut self, symbol: &str) -> &mut Self {
         self.symbol = Some(CompactString::new(symbol));
+        self.span = Span::Symbol;
         self
     }
 
@@ -164,6 +235,7 @@ impl Cell {
     /// This is particularly useful for adding zero-width characters to the cell.
     pub(crate) fn append_symbol(&mut self, symbol: &str) -> &mut Self {
         self.symbol.get_or_insert_default().push_str(symbol);
+        self.span = Span::Symbol;
         self
     }
 
@@ -171,6 +243,7 @@ impl Cell {
     pub fn set_char(&mut self, ch: char) -> &mut Self {
         let mut buf = [0; 4];
         self.symbol = Some(CompactString::new(ch.encode_utf8(&mut buf)));
+        self.span = Span::Symbol;
         self
     }
 
@@ -236,9 +309,8 @@ impl Cell {
 
     /// Sets cell [`CellDiffOption`].
     ///
-    /// The diff options are for dealing with cells that are wider than a unit, that should always
-    /// be updated, or that should not be updated at all (skip output due to preceding wider
-    /// cells).
+    /// The diff options are for cells that should always be updated, or that should not be
+    /// updated at all (for example because an image drawn by an escape sequence covers them).
     pub const fn set_diff_option(&mut self, diff_option: CellDiffOption) -> &mut Self {
         self.diff_option = diff_option;
         self
@@ -276,6 +348,7 @@ impl PartialEq for Cell {
             && self.bg == other.bg
             && self.modifier == other.modifier
             && self.diff_option == other.diff_option
+            && self.span == other.span
     }
 }
 
@@ -296,6 +369,7 @@ impl core::hash::Hash for Cell {
         self.diff_option.hash(state);
         #[allow(deprecated)]
         self.skip.hash(state);
+        self.span.hash(state);
     }
 }
 
@@ -308,24 +382,30 @@ impl From<char> for Cell {
 }
 
 impl CellWidth for Cell {
-    /// Returns [`CellDiffOption::ForcedWidth`] when set, otherwise computes the width from the
-    /// cell's symbol.
+    /// Returns the number of columns the cell's glyph covers.
+    ///
+    /// This is the declared width for a cell written with
+    /// [`CellMut::set_symbol_with_width`](super::CellMut::set_symbol_with_width) (or clipped by the
+    /// edge of the buffer), zero for a [continuation](Self::is_continuation) cell, and otherwise
+    /// the width of the cell's symbol.
     ///
     /// A cell holds a single grapheme cluster, so the unicode width of its symbol is the number
     /// of columns it takes on screen. Low-level callers can store anything in a symbol though,
     /// and image protocols store a whole escape sequence there while still occupying a single
     /// column. Such a symbol has no meaningful unicode width, so it counts as one column.
-    /// Use [`CellDiffOption::ForcedWidth`] to declare the real width of these cells.
     fn cell_width(&self) -> u16 {
-        if let CellDiffOption::ForcedWidth(width) = self.diff_option {
-            return width.get();
-        }
-        let symbol = self.symbol();
-        let width = symbol.cell_width();
-        if width > 1 && !is_single_grapheme(symbol) {
-            1
-        } else {
-            width
+        match self.span {
+            Span::Fixed(width) => width.get(),
+            Span::Continuation => 0,
+            Span::Symbol => {
+                let symbol = self.symbol();
+                let width = symbol.cell_width();
+                if width > 1 && !is_single_grapheme(symbol) {
+                    1
+                } else {
+                    width
+                }
+            }
         }
     }
 }
@@ -360,12 +440,15 @@ mod tests {
     }
 
     #[test]
-    fn cell_width_of_forced_width_symbol() {
+    fn cell_width_of_fixed_span() {
         let payload = "\u{1b}[s".repeat(400);
         let mut cell = Cell::EMPTY;
         cell.set_symbol(&payload);
-        cell.set_diff_option(CellDiffOption::ForcedWidth(NonZeroU16::new(24).unwrap()));
+        cell.set_span(Span::Fixed(NonZeroU16::new(24).unwrap()));
         assert_eq!(cell.cell_width(), 24);
+        // A new symbol is measured again.
+        cell.set_symbol("a");
+        assert_eq!(cell.cell_width(), 1);
     }
 
     #[test]
@@ -383,6 +466,7 @@ mod tests {
                 modifier: Modifier::empty(),
                 diff_option: CellDiffOption::None,
                 skip: false,
+                span: Span::Symbol,
             }
         );
     }
