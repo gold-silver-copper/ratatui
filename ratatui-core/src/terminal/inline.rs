@@ -1,5 +1,5 @@
 use crate::backend::Backend;
-use crate::buffer::{Buffer, Cell};
+use crate::buffer::{Buffer, Cell, CellWidth};
 use crate::layout::{Position, Rect, Size};
 use crate::terminal::{Terminal, Viewport};
 
@@ -308,11 +308,7 @@ impl<B: Backend> Terminal<B> {
         let width: usize = self.last_known_area.width.into();
         let (to_draw, remainder) = cells.split_at(width * lines_to_draw as usize);
         if lines_to_draw > 0 {
-            let iter = to_draw
-                .iter()
-                .enumerate()
-                .map(|(i, c)| ((i % width) as u16, y_offset + (i / width) as u16, c));
-            self.backend.draw(iter)?;
+            self.backend.draw(visible_cells(to_draw, width, y_offset))?;
             self.backend.flush()?;
         }
         Ok(remainder)
@@ -425,9 +421,34 @@ pub(crate) fn compute_inline_size<B: Backend>(
     ))
 }
 
+/// Positions `cells` as rows of `width` cells starting at row `y_offset`, leaving out the cells
+/// hidden behind wide glyphs. Drawing a hidden cell after its glyph would overwrite the glyph.
+fn visible_cells(
+    cells: &[Cell],
+    width: usize,
+    y_offset: u16,
+) -> impl Iterator<Item = (u16, u16, &Cell)> {
+    let mut hidden = 0;
+    cells.iter().enumerate().filter_map(move |(i, cell)| {
+        let x = i % width;
+        if x == 0 {
+            hidden = 0;
+        }
+        if hidden > 0 {
+            hidden -= 1;
+            return None;
+        }
+        hidden = cell.cell_width().saturating_sub(1);
+        Some((x as u16, y_offset + (i / width) as u16, cell))
+    })
+}
+
 #[cfg(test)]
 mod tests {
+    use alloc::vec::Vec;
+
     use crate::backend::{Backend, TestBackend};
+    use crate::buffer::Buffer;
     use crate::layout::{Position, Rect, Size};
     use crate::style::Style;
     use crate::terminal::inline::compute_inline_size;
@@ -485,6 +506,18 @@ mod tests {
             compute_inline_size(&mut backend, 4, Size::new(10, 10), 5).unwrap();
 
         assert_eq!(area, Rect::new(0, 0, 10, 4));
+    }
+
+    #[test]
+    fn visible_cells_leave_out_cells_hidden_behind_wide_glyphs() {
+        let buffer = Buffer::with_lines(["界a", "b界"]);
+        let cells: Vec<_> = super::visible_cells(&buffer.content, 3, 5)
+            .map(|(x, y, cell)| (x, y, cell.symbol()))
+            .collect();
+        assert_eq!(
+            cells,
+            [(0, 5, "界"), (2, 5, "a"), (0, 6, "b"), (1, 6, "界")]
+        );
     }
 
     #[test]
