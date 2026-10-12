@@ -1,4 +1,5 @@
 use crate::backend::Backend;
+use crate::buffer::visible::visible_cells;
 use crate::buffer::{Buffer, Cell};
 use crate::layout::{Position, Rect, Size};
 use crate::terminal::{Terminal, Viewport};
@@ -308,10 +309,11 @@ impl<B: Backend> Terminal<B> {
         let width: usize = self.last_known_area.width.into();
         let (to_draw, remainder) = cells.split_at(width * lines_to_draw as usize);
         if lines_to_draw > 0 {
-            let iter = to_draw
-                .iter()
-                .enumerate()
-                .map(|(i, c)| ((i % width) as u16, y_offset + (i / width) as u16, c));
+            // Leave out cells hidden behind wide glyphs: drawn after the glyph, they erase it.
+            let iter = visible_cells(to_draw, self.last_known_area.width).map(|c| {
+                let (x, y) = (c.index % width, c.index / width);
+                (x as u16, y_offset + y as u16, c.cell)
+            });
             self.backend.draw(iter)?;
             self.backend.flush()?;
         }
@@ -505,7 +507,12 @@ mod tests {
 
     #[cfg(not(feature = "scrolling-regions"))]
     mod no_scrolling_regions {
+        use alloc::string::String;
+        use alloc::vec::Vec;
+
         use super::*;
+        use crate::backend::{ClearType, WindowSize};
+        use crate::buffer::Cell;
 
         #[test]
         fn insert_before_is_noop_for_non_inline_viewports() {
@@ -738,6 +745,88 @@ mod tests {
                 "BBBBBBBBBB",
                 "BBBBBBBBBB",
             ]);
+        }
+
+        /// Records every cell the terminal draws, on top of a [`TestBackend`].
+        struct RecordingBackend {
+            inner: TestBackend,
+            drawn: Vec<(u16, u16, String)>,
+        }
+
+        impl Backend for RecordingBackend {
+            type Error = core::convert::Infallible;
+
+            fn draw<'a, I>(&mut self, content: I) -> Result<(), Self::Error>
+            where
+                I: Iterator<Item = (u16, u16, &'a Cell)>,
+            {
+                let content: Vec<_> = content.collect();
+                self.drawn
+                    .extend(content.iter().map(|(x, y, c)| (*x, *y, c.symbol().into())));
+                self.inner.draw(content.into_iter())
+            }
+            fn append_lines(&mut self, n: u16) -> Result<(), Self::Error> {
+                self.inner.append_lines(n)
+            }
+            fn hide_cursor(&mut self) -> Result<(), Self::Error> {
+                self.inner.hide_cursor()
+            }
+            fn show_cursor(&mut self) -> Result<(), Self::Error> {
+                self.inner.show_cursor()
+            }
+            fn get_cursor_position(&mut self) -> Result<Position, Self::Error> {
+                self.inner.get_cursor_position()
+            }
+            fn set_cursor_position<P: Into<Position>>(
+                &mut self,
+                position: P,
+            ) -> Result<(), Self::Error> {
+                self.inner.set_cursor_position(position)
+            }
+            fn clear(&mut self) -> Result<(), Self::Error> {
+                self.inner.clear()
+            }
+            fn clear_region(&mut self, clear_type: ClearType) -> Result<(), Self::Error> {
+                self.inner.clear_region(clear_type)
+            }
+            fn size(&self) -> Result<Size, Self::Error> {
+                self.inner.size()
+            }
+            fn window_size(&mut self) -> Result<WindowSize, Self::Error> {
+                self.inner.window_size()
+            }
+            fn flush(&mut self) -> Result<(), Self::Error> {
+                self.inner.flush()
+            }
+        }
+
+        /// Regression for <https://github.com/gold-silver-copper/ratatui/issues/6>: the cell hidden
+        /// behind a wide glyph was drawn after the glyph, and erased it on a real terminal.
+        #[test]
+        fn insert_before_does_not_draw_cells_hidden_behind_wide_glyphs() {
+            let backend = RecordingBackend {
+                inner: TestBackend::new(4, 4),
+                drawn: Vec::new(),
+            };
+            let options = TerminalOptions {
+                viewport: Viewport::Inline(2),
+            };
+            let mut terminal = Terminal::with_options(backend, options).unwrap();
+
+            terminal
+                .insert_before(1, |buf| {
+                    buf.set_string(0, 0, "界ab", Style::default());
+                })
+                .unwrap();
+
+            let line: Vec<_> = terminal
+                .backend()
+                .drawn
+                .iter()
+                .filter(|(_, y, _)| *y == 0)
+                .map(|(x, _, symbol)| (*x, symbol.as_str()))
+                .collect();
+            assert_eq!(line, [(0, "界"), (2, "a"), (3, "b")]);
         }
     }
 
