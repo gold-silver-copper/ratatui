@@ -1,3 +1,6 @@
+use core::ops::Range;
+
+use crate::buffer::visible::{VisibleCell, VisibleCells, is_skip, visible_cells};
 use crate::buffer::{Buffer, Cell, CellDiffOption, CellWidth};
 use crate::layout::Rect;
 use crate::style::{Color, Modifier};
@@ -9,31 +12,31 @@ use crate::style::{Color, Modifier};
 /// [`CellDiffOption`] directives.
 #[derive(Debug)]
 pub struct BufferDiff<'prev, 'next> {
+    /// The cells of `next` that are drawn, skipping those hidden behind wide glyphs.
+    cells: VisibleCells<'next>,
     /// The next (current) buffer's cells.
     next: &'next [Cell],
     /// The previous buffer's cells.
     prev: &'prev [Cell],
-    /// Buffer width (for `pos_of` calculation).
+    /// Buffer area (for `pos_of` calculation).
     area: Rect,
-    /// Current position in the flat cell array.
-    pos: usize,
-    /// Tracks trailing cells and a leading cell that may be deferred until after they are cleared.
-    trailing: Option<TrailingState>,
+    /// Hidden cells of a wide glyph to clear before repainting the glyph.
+    hidden: Option<HiddenCells>,
+    /// Visible cells before this index are emitted even when unchanged.
+    force_until: usize,
 }
 
-/// Tracks pending trailing-cell yields for a wide character update.
+/// The hidden cells of a wide glyph that are cleared before the glyph is repainted.
 #[derive(Debug)]
-struct TrailingState {
-    next_index: usize,
-    end: usize,
-    /// When `true`, all cells in the trailing range are emitted unconditionally: the previous
-    /// wide character's style was visible on blank cells, so the terminal may show stale style
-    /// there and every trailing cell must be refreshed.
-    ///
-    /// When `false`, only cells whose symbol changed are emitted.
+struct HiddenCells {
+    /// The hidden cells still to clear.
+    range: Range<usize>,
+    /// When `true`, every cell in the range is emitted: the glyph's previous style was visible on
+    /// blank cells, so the terminal may show stale style there. When `false`, only cells whose
+    /// symbol changed are emitted.
     force: bool,
-    /// Leading cell to repaint after its trailing cells have been processed.
-    deferred_leading_cell: Option<usize>,
+    /// The wide glyph, repainted after its hidden cells.
+    glyph: usize,
 }
 
 /// Modifiers that are visually apparent on a blank (space) cell.
@@ -63,24 +66,27 @@ impl<'prev, 'next> BufferDiff<'prev, 'next> {
 
         let mut area = prev.area;
         area.height = area.height.min(next.area.height);
+        let len = next.content.len().min(prev.content.len());
+        let next = &next.content[..len];
 
         Self {
-            next: &next.content,
-            prev: &prev.content,
+            cells: visible_cells(next, area.width),
+            next,
+            prev: &prev.content[..len],
             area,
-            pos: 0,
-            trailing: None,
+            hidden: None,
+            force_until: 0,
         }
     }
 
-    /// Converts a flat index to (x, y) coordinates.
-    const fn pos_of(&self, index: usize) -> (u16, u16) {
+    /// Converts a flat index to (x, y, cell).
+    const fn emit(&self, index: usize) -> (u16, u16, &'next Cell) {
         let w = self.area.width as usize;
 
         let x = index % w + self.area.x as usize;
         let y = index / w + self.area.y as usize;
 
-        (x as u16, y as u16)
+        (x as u16, y as u16, &self.next[index])
     }
 }
 
@@ -88,123 +94,75 @@ impl<'next> Iterator for BufferDiff<'_, 'next> {
     type Item = (u16, u16, &'next Cell);
 
     fn next(&mut self) -> Option<Self::Item> {
-        let len = self.next.len().min(self.prev.len());
-
-        // First, yield any pending trailing cells.
-        if let Some(TrailingState {
-            next_index,
-            end,
-            force,
-            deferred_leading_cell,
-        }) = &mut self.trailing
-        {
-            while *next_index < *end {
-                let j = *next_index;
-                // Advance past this cell; if it is wide, also skip its own trailing column
-                // so the main loop does not emit a spurious EMPTY write over it.
-                let cell_width = self.next[j].cell_width().max(1) as usize;
-                *next_index += cell_width;
-                *end = (*end).max(*next_index).min(len);
-
-                if !is_skip(&self.next[j])
-                    && (*force || self.prev[j].symbol() != self.next[j].symbol())
-                {
-                    let (tx, ty) = self.pos_of(j);
-                    return Some((tx, ty, &self.next[j]));
-                }
+        // First, clear any pending hidden cells, then repaint their glyph.
+        if let Some(hidden) = &mut self.hidden {
+            let force = hidden.force;
+            if let Some(j) = hidden.range.find(|&j| {
+                !is_skip(&self.next[j]) && (force || self.prev[j].symbol() != self.next[j].symbol())
+            }) {
+                return Some(self.emit(j));
             }
-
-            // Resume after the wide glyph, repainting its deferred leading cell first.
-            self.pos = *end;
-            let deferred_leading_cell = deferred_leading_cell.take();
-            self.trailing = None;
-            if let Some(i) = deferred_leading_cell {
-                let (x, y) = self.pos_of(i);
-                return Some((x, y, &self.next[i]));
-            }
+            let glyph = hidden.glyph;
+            self.hidden = None;
+            return Some(self.emit(glyph));
         }
-        while self.pos < len {
-            let i = self.pos;
-            self.pos += 1;
 
-            let current = &self.next[i];
-            let previous = &self.prev[i];
+        while let Some(VisibleCell {
+            index: i,
+            width,
+            cell: current,
+        }) = self.cells.next()
+        {
+            let Some(previous) = self.prev.get(i) else {
+                break;
+            };
+            let forced = i < self.force_until;
 
             match current.diff_option {
                 CellDiffOption::Skip => {}
-                _ if is_skip(current) => {}
-
-                CellDiffOption::ForcedWidth(width) => {
-                    self.pos = self
-                        .pos
-                        .saturating_add(width.get().saturating_sub(1) as usize);
-                    if current != previous {
-                        let (x, y) = self.pos_of(i);
-                        return Some((x, y, &self.next[i]));
+                CellDiffOption::ForcedWidth(_) => {
+                    if forced || current != previous {
+                        return Some(self.emit(i));
                     }
                 }
                 CellDiffOption::None | CellDiffOption::AlwaysUpdate => {
-                    let cell_width = current.cell_width() as usize;
-                    if matches!(current.diff_option, CellDiffOption::None) && current == previous {
-                        // Equal cells still need to account for multi-width skip.
-                        self.pos += cell_width.saturating_sub(1);
+                    if matches!(current.diff_option, CellDiffOption::None)
+                        && !forced
+                        && current == previous
+                    {
                         continue;
                     }
 
-                    let previous_width = previous.cell_width() as usize;
                     let previous_style_is_visible_on_blank = previous.bg != Color::Reset
                         || previous.modifier.intersects(VISIBLE_ON_BLANK);
 
-                    // Clear stale styles from an unchanged wide glyph's trailing cells before
-                    // repainting it.
-                    if cell_width > 1
-                        && current.symbol() == previous.symbol()
-                        && current.style() != previous.style()
-                        && previous_style_is_visible_on_blank
-                    {
-                        self.trailing = Some(TrailingState {
-                            next_index: i + 1,
-                            end: (i + cell_width).min(len),
-                            force: true,
-                            deferred_leading_cell: Some(i),
-                        });
-                        return self.next();
+                    // Clear the hidden cells first, then repaint the glyph, when the glyph's
+                    // stale style may still show on them, or when terminals disagree on its width
+                    // (so the hidden cells cannot overwrite it).
+                    if width > 1 {
+                        let restyled = previous_style_is_visible_on_blank
+                            && current.symbol() == previous.symbol()
+                            && current.style() != previous.style();
+                        if restyled || has_uncertain_width(current.symbol()) {
+                            self.hidden = Some(HiddenCells {
+                                range: i + 1..i + width,
+                                force: restyled,
+                                glyph: i,
+                            });
+                            return self.next();
+                        }
                     }
 
-                    // Clear reserved columns first so they cannot overwrite the uncertain-width
-                    // glyph.
-                    let uncertain_width = cell_width > 1 && has_uncertain_width(current.symbol());
-
-                    if uncertain_width {
-                        let trailing_end = (i + cell_width).min(len);
-                        self.trailing = Some(TrailingState {
-                            next_index: i + 1,
-                            end: trailing_end,
-                            force: false,
-                            deferred_leading_cell: Some(i),
-                        });
-                        // Recurses once and returns the deferred leading cell.
-                        return self.next();
-                    } else if cell_width > 1 {
-                        self.pos += cell_width.saturating_sub(1);
-                    } else if previous_width > cell_width && previous_style_is_visible_on_blank {
-                        // The previous wide character's style is visible on blank cells, so the
-                        // terminal may still show it on the trailing columns even after the
-                        // character is replaced. Force-emit every cell in the trailing range to
-                        // refresh the terminal regardless of whether the buffer content changed.
-                        // This cell is narrow, so those columns stay adjacent and need no move.
-                        self.trailing = Some(TrailingState {
-                            next_index: i + 1,
-                            end: (i + previous_width).min(len),
-                            force: true,
-                            deferred_leading_cell: None,
-                        });
-                    } else {
-                        // single-width character, no position adjustment needed
+                    // The previous wide character's style is visible on blank cells, so the
+                    // terminal may still show it on the columns it covered even after the
+                    // character is replaced. Emit every cell drawn over those columns.
+                    let previous_width = usize::from(previous.cell_width());
+                    if previous_width > width && previous_style_is_visible_on_blank {
+                        let row_end = (i / self.area.width as usize + 1) * self.area.width as usize;
+                        self.force_until = (i + previous_width).min(row_end);
                     }
 
-                    let (x, y) = self.pos_of(i);
-                    return Some((x, y, &self.next[i]));
+                    return Some(self.emit(i));
                 }
             }
         }
@@ -221,13 +179,6 @@ impl<'next> Iterator for BufferDiff<'_, 'next> {
 /// both.
 fn has_uncertain_width(symbol: &str) -> bool {
     symbol.chars().any(|c| c == '\u{FE0F}')
-}
-
-/// Returns `true` if this cell should be skipped during diffing.
-#[allow(deprecated)]
-const fn is_skip(cell: &Cell) -> bool {
-    matches!(cell.diff_option, CellDiffOption::Skip)
-        || (cell.skip && matches!(cell.diff_option, CellDiffOption::None))
 }
 
 #[cfg(test)]
@@ -737,6 +688,21 @@ mod tests {
         );
         assert_eq!((diff[0].0, diff[0].1), (2, 0));
         assert_eq!(diff[0].2.symbol(), "a");
+    }
+
+    /// A wide glyph in the last column of a row has no room for its hidden cell. It must not hide
+    /// the first cell of the next row, or that cell is never updated.
+    #[test]
+    fn wide_glyph_ending_a_row_does_not_hide_the_next_row() {
+        let prev = Buffer::with_lines(["ab", "cd"]);
+        let mut next = Buffer::with_lines(["ab", "xd"]);
+        next.content[1].set_symbol("界");
+
+        let diff: Vec<_> = BufferDiff::new(&prev, &next)
+            .map(|(x, y, cell)| (x, y, cell.symbol()))
+            .collect();
+
+        assert_eq!(diff, [(1, 0, "界"), (0, 1, "x")]);
     }
 
     #[test]
