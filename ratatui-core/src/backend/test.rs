@@ -3,8 +3,7 @@
 
 use alloc::string::String;
 use alloc::vec;
-use core::fmt;
-use core::iter;
+use core::{fmt, iter};
 
 use crate::backend::{Backend, ClearType, WindowSize};
 use crate::buffer::{Buffer, Cell};

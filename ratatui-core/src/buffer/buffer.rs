@@ -39,7 +39,9 @@ use crate::text::{Line, Span};
 /// buf.cell_mut(Position { x: 0, y: 0 })
 ///     .ok_or("cell not found")?
 ///     .set_symbol("A");
-/// buf.cell_mut((0, 1)).ok_or("cell not found")?.set_symbol("B");
+/// buf.cell_mut((0, 1))
+///     .ok_or("cell not found")?
+///     .set_symbol("B");
 ///
 /// // reading a cell by indexing with a Position or an (x, y) tuple
 /// assert_eq!(buf[Position { x: 0, y: 0 }].symbol(), "A");
@@ -227,7 +229,8 @@ impl Buffer {
     /// let mut buffer = Buffer::empty(Rect::new(0, 0, 10, 10));
     ///
     /// if let Some(mut cell) = buffer.cell_mut(Position::new(0, 0)) {
-    ///     cell.set_symbol("A").set_style(Style::default().fg(Color::Red));
+    ///     cell.set_symbol("A")
+    ///         .set_style(Style::default().fg(Color::Red));
     /// }
     /// assert_eq!(buffer[(0, 0)].symbol(), "A");
     /// assert!(buffer.cell_mut((10, 10)).is_none());
@@ -247,11 +250,21 @@ impl Buffer {
     /// This is the one place that changes how many columns a glyph covers:
     ///
     /// - If the cell was covered by a wide glyph, that glyph's cells to the left become blank.
-    /// - The cells the new glyph covers become its continuations, clipped to the row; a glyph
-    ///   cut short by the edge of the buffer declares the columns it kept.
+    /// - The cells the new glyph covers become its continuations, clipped to the row; a glyph cut
+    ///   short by the edge of the buffer declares the columns it kept.
     /// - Continuations right after the new glyph belonged to a glyph it overwrote, and become
     ///   blank.
     fn write(&mut self, position: Position, update: impl FnOnce(&mut Cell)) {
+        self.write_measured(position, None, update);
+    }
+
+    /// [`write`](Self::write), for a caller that already measured the new glyph's width.
+    fn write_measured(
+        &mut self,
+        position: Position,
+        measured: Option<u16>,
+        update: impl FnOnce(&mut Cell),
+    ) {
         let Some(index) = self.index_of_opt(position) else {
             return;
         };
@@ -271,7 +284,7 @@ impl Buffer {
 
         let anchor = &mut self.content[index];
         update(anchor);
-        let columns = usize::from(anchor.columns());
+        let columns = usize::from(measured.map_or_else(|| anchor.columns(), |width| width.max(1)));
         let end = (index + columns).min(row_end);
         if end - index < columns {
             // `end - index` is at least one and at most the buffer width.
@@ -435,7 +448,7 @@ impl Buffer {
             });
         let style = style.into();
         for (symbol, width) in graphemes {
-            self.write(Position { x, y }, |cell| {
+            self.write_measured(Position { x, y }, Some(width), |cell| {
                 cell.set_symbol(symbol).set_style(style);
             });
             x += width;
@@ -1280,7 +1293,8 @@ mod tests {
         // Halfwidth katakana + non-combining dakuten (U+FF9E): grapheme cluster takes 2 cells
         let mut buffer = Buffer::empty(area);
         buffer.set_string(0, 0, "ｶﾞ", Style::default());
-        // The whole grapheme cluster "ｶﾞ" is placed in cell[0], and cell[1] is its continuation (width=2)
+        // The whole grapheme cluster "ｶﾞ" is placed in cell[0], and cell[1] is its continuation
+        // (width=2)
         assert_eq!(buffer.content[0].symbol(), "ｶﾞ");
         assert!(buffer.content[1].is_continuation());
         assert_eq!(buffer.content[2].symbol(), " ");
