@@ -150,7 +150,9 @@ impl Widget for RatatuiMascot {
                     continue;
                 }
 
-                let cell = &mut buf[(x, y)];
+                let Some(mut cell) = buf.cell_mut((x, y)) else {
+                    continue;
+                };
                 // given two cells which make up the top and bottom of the character,
                 // Foreground color should be the non-space, non-terminal
                 let (fg, bg) = match (ch1, ch2) {
@@ -170,10 +172,10 @@ impl Widget for RatatuiMascot {
                     (_, _) => Some('▀'),
                 };
                 if let Some(fg) = fg {
-                    cell.fg = fg;
+                    cell.set_fg(fg);
                 }
                 if let Some(bg) = bg {
-                    cell.bg = bg;
+                    cell.set_bg(bg);
                 }
                 if let Some(symb) = symbol {
                     cell.set_char(symb);
@@ -212,7 +214,7 @@ mod tests {
         assert_eq!(buf.area.as_size(), (32, 16).into());
         assert_eq!(buf[(21, 5)].bg, Color::Indexed(236));
         assert_eq!(
-            buf.content
+            buf.content()
                 .iter()
                 .map(ratatui_core::buffer::Cell::symbol)
                 .collect::<String>(),
@@ -234,7 +236,7 @@ mod tests {
                 "█                    ▀▄▀  ▄██   ",
                 " ▀▄                    ▀▄▀█     ",
             ])
-            .content
+            .content()
             .iter()
             .map(ratatui_core::buffer::Cell::symbol)
             .collect::<String>()

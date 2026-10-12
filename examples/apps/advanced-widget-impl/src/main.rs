@@ -235,7 +235,9 @@ fn fill<S: Into<Style>>(area: Rect, buf: &mut Buffer, symbol: &str, style: S) {
     let style = style.into();
     for y in area.top()..area.bottom() {
         for x in area.left()..area.right() {
-            buf[(x, y)].set_symbol(symbol).set_style(style);
+            if let Some(mut cell) = buf.cell_mut((x, y)) {
+                cell.set_symbol(symbol).set_style(style);
+            }
         }
     }
 }

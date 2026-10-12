@@ -5,8 +5,13 @@ use crate::style::{Color, Modifier};
 /// A zero-allocation iterator over the differences between two buffers of the same width.
 ///
 /// Yields `(x, y, &Cell)` tuples for each cell in `next` that differs from the corresponding cell
-/// in `prev`. Handles multi-width characters (including VS16 emoji trailing cells) and
-/// [`CellDiffOption`] directives.
+/// in `prev`. [Continuation](Cell::is_continuation) cells are never yielded: the wide glyph they
+/// belong to draws them, and writing to them would erase it. A continuation in `prev` that is a
+/// cell of its own in `next` differs from it, so the columns freed by a wide glyph are redrawn
+/// without special handling.
+///
+/// Before a wide glyph, the diff may yield blank cells over the columns the glyph covers, for
+/// terminals that would otherwise leave stale content there (see `needs_clearing`).
 #[derive(Debug)]
 pub struct BufferDiff<'prev, 'next> {
     /// The next (current) buffer's cells.
@@ -17,31 +22,19 @@ pub struct BufferDiff<'prev, 'next> {
     area: Rect,
     /// Current position in the flat cell array.
     pos: usize,
-    /// Tracks trailing cells and a leading cell that may be deferred until after they are cleared.
-    trailing: Option<TrailingState>,
+    /// The wide glyph being drawn, whose other columns may need clearing first.
+    clearing: Option<Clearing>,
 }
 
-/// Tracks pending trailing-cell yields for a wide character update.
+/// The columns of a wide glyph still to check for clearing, and the glyph to draw after them.
 #[derive(Debug)]
-struct TrailingState {
-    next_index: usize,
-    end: usize,
-    /// When `true`, all cells in the trailing range are emitted unconditionally: the previous
-    /// wide character's style was visible on blank cells, so the terminal may show stale style
-    /// there and every trailing cell must be refreshed.
-    ///
-    /// When `false`, only cells whose symbol changed are emitted.
-    force: bool,
-    /// Leading cell to repaint after its trailing cells have been processed.
-    deferred_leading_cell: Option<usize>,
+struct Clearing {
+    columns: core::ops::Range<usize>,
+    anchor: usize,
 }
 
-/// Modifiers that are visually apparent on a blank (space) cell.
-const VISIBLE_ON_BLANK: Modifier = Modifier::REVERSED
-    .union(Modifier::UNDERLINED)
-    .union(Modifier::SLOW_BLINK)
-    .union(Modifier::RAPID_BLINK)
-    .union(Modifier::CROSSED_OUT);
+/// A blank cell, used to clear the columns of a wide glyph before drawing it.
+static BLANK: Cell = Cell::EMPTY;
 
 impl<'prev, 'next> BufferDiff<'prev, 'next> {
     /// Creates a new iterator over the differences between `prev` and `next` terminal cells.
@@ -69,7 +62,7 @@ impl<'prev, 'next> BufferDiff<'prev, 'next> {
             prev: &prev.content,
             area,
             pos: 0,
-            trailing: None,
+            clearing: None,
         }
     }
 
@@ -82,135 +75,89 @@ impl<'prev, 'next> BufferDiff<'prev, 'next> {
 
         (x as u16, y as u16)
     }
+
+    /// The item for `cell`, drawn at `index`.
+    const fn item(&self, index: usize, cell: &'next Cell) -> (u16, u16, &'next Cell) {
+        let (x, y) = self.pos_of(index);
+        (x, y, cell)
+    }
 }
 
 impl<'next> Iterator for BufferDiff<'_, 'next> {
     type Item = (u16, u16, &'next Cell);
 
     fn next(&mut self) -> Option<Self::Item> {
-        let len = self.next.len().min(self.prev.len());
-
-        // First, yield any pending trailing cells.
-        if let Some(TrailingState {
-            next_index,
-            end,
-            force,
-            deferred_leading_cell,
-        }) = &mut self.trailing
-        {
-            while *next_index < *end {
-                let j = *next_index;
-                // Advance past this cell; if it is wide, also skip its own trailing column
-                // so the main loop does not emit a spurious EMPTY write over it.
-                let cell_width = self.next[j].cell_width().max(1) as usize;
-                *next_index += cell_width;
-                *end = (*end).max(*next_index).min(len);
-
-                if !is_skip(&self.next[j])
-                    && (*force || self.prev[j].symbol() != self.next[j].symbol())
-                {
-                    let (tx, ty) = self.pos_of(j);
-                    return Some((tx, ty, &self.next[j]));
+        if let Some(clearing) = &mut self.clearing {
+            let anchor = &self.next[clearing.anchor];
+            for column in clearing.columns.by_ref() {
+                if needs_clearing(anchor, &self.prev[column]) {
+                    return Some(self.item(column, &BLANK));
                 }
             }
-
-            // Resume after the wide glyph, repainting its deferred leading cell first.
-            self.pos = *end;
-            let deferred_leading_cell = deferred_leading_cell.take();
-            self.trailing = None;
-            if let Some(i) = deferred_leading_cell {
-                let (x, y) = self.pos_of(i);
-                return Some((x, y, &self.next[i]));
-            }
+            let anchor = clearing.anchor;
+            self.clearing = None;
+            return Some(self.item(anchor, &self.next[anchor]));
         }
+
+        let len = self.next.len().min(self.prev.len());
         while self.pos < len {
             let i = self.pos;
             self.pos += 1;
 
             let current = &self.next[i];
-            let previous = &self.prev[i];
-
-            match current.diff_option {
-                CellDiffOption::Skip => {}
-                _ if is_skip(current) => {}
-
-                CellDiffOption::ForcedWidth(width) => {
-                    self.pos = self
-                        .pos
-                        .saturating_add(width.get().saturating_sub(1) as usize);
-                    if current != previous {
-                        let (x, y) = self.pos_of(i);
-                        return Some((x, y, &self.next[i]));
-                    }
-                }
-                CellDiffOption::None | CellDiffOption::AlwaysUpdate => {
-                    let cell_width = current.cell_width() as usize;
-                    if matches!(current.diff_option, CellDiffOption::None) && current == previous {
-                        // Equal cells still need to account for multi-width skip.
-                        self.pos += cell_width.saturating_sub(1);
-                        continue;
-                    }
-
-                    let previous_width = previous.cell_width() as usize;
-                    let previous_style_is_visible_on_blank = previous.bg != Color::Reset
-                        || previous.modifier.intersects(VISIBLE_ON_BLANK);
-
-                    // Clear stale styles from an unchanged wide glyph's trailing cells before
-                    // repainting it.
-                    if cell_width > 1
-                        && current.symbol() == previous.symbol()
-                        && current.style() != previous.style()
-                        && previous_style_is_visible_on_blank
-                    {
-                        self.trailing = Some(TrailingState {
-                            next_index: i + 1,
-                            end: (i + cell_width).min(len),
-                            force: true,
-                            deferred_leading_cell: Some(i),
-                        });
-                        return self.next();
-                    }
-
-                    // Clear reserved columns first so they cannot overwrite the uncertain-width
-                    // glyph.
-                    let uncertain_width = cell_width > 1 && has_uncertain_width(current.symbol());
-
-                    if uncertain_width {
-                        let trailing_end = (i + cell_width).min(len);
-                        self.trailing = Some(TrailingState {
-                            next_index: i + 1,
-                            end: trailing_end,
-                            force: false,
-                            deferred_leading_cell: Some(i),
-                        });
-                        // Recurses once and returns the deferred leading cell.
-                        return self.next();
-                    } else if cell_width > 1 {
-                        self.pos += cell_width.saturating_sub(1);
-                    } else if previous_width > cell_width && previous_style_is_visible_on_blank {
-                        // The previous wide character's style is visible on blank cells, so the
-                        // terminal may still show it on the trailing columns even after the
-                        // character is replaced. Force-emit every cell in the trailing range to
-                        // refresh the terminal regardless of whether the buffer content changed.
-                        // This cell is narrow, so those columns stay adjacent and need no move.
-                        self.trailing = Some(TrailingState {
-                            next_index: i + 1,
-                            end: (i + previous_width).min(len),
-                            force: true,
-                            deferred_leading_cell: None,
-                        });
-                    } else {
-                        // single-width character, no position adjustment needed
-                    }
-
-                    let (x, y) = self.pos_of(i);
-                    return Some((x, y, &self.next[i]));
-                }
+            if current.is_continuation()
+                || is_skip(current)
+                || (current.diff_option != CellDiffOption::AlwaysUpdate && *current == self.prev[i])
+            {
+                continue;
             }
+
+            // A wide glyph's continuation cells end the glyph within its row.
+            let width = current.cell_width() as usize;
+            if width > 1 {
+                self.clearing = Some(Clearing {
+                    columns: i + 1..(i + width).min(len),
+                    anchor: i,
+                });
+                return self.next();
+            }
+            return Some(self.item(i, current));
         }
 
         None
     }
+}
+
+/// Returns `true` if a column covered by the wide glyph `anchor` must be blanked before the glyph
+/// is drawn, because drawing the glyph may leave `previous` visible there.
+///
+/// Drawing the glyph repaints its columns on most terminals, but not on all of them:
+///
+/// - Terminals disagree on the width of emoji presentation sequences (those containing VS16,
+///   `U+FE0F`): some draw them in one column, and then show what the other column held before.
+/// - Some terminals (the Windows console) keep the attributes of the other columns when a wide
+///   glyph is redrawn, so a background or underline the glyph had there stays.
+///
+/// Blanking first is correct everywhere: a terminal that draws the glyph in full covers the
+/// blank.
+fn needs_clearing(anchor: &Cell, previous: &Cell) -> bool {
+    if previous.is_continuation() {
+        shows_on_blank(previous) && previous.style() != anchor.style()
+    } else {
+        (previous.symbol() != " " || shows_on_blank(previous))
+            && has_uncertain_width(anchor.symbol())
+    }
+}
+
+/// Returns `true` if the cell's style is visible on a blank cell.
+fn shows_on_blank(cell: &Cell) -> bool {
+    /// Modifiers that are visible on a blank cell.
+    const VISIBLE_ON_BLANK: Modifier = Modifier::REVERSED
+        .union(Modifier::UNDERLINED)
+        .union(Modifier::SLOW_BLINK)
+        .union(Modifier::RAPID_BLINK)
+        .union(Modifier::CROSSED_OUT);
+    cell.bg != Color::Reset || cell.modifier.intersects(VISIBLE_ON_BLANK)
 }
 
 /// Returns `true` if terminals disagree on how many columns `symbol` occupies.
@@ -240,7 +187,13 @@ mod tests {
     use super::*;
     use crate::buffer::Buffer;
     use crate::layout::Rect;
-    use crate::style::Color;
+    use crate::style::{Color, Style};
+
+    fn row(width: u16, content: &str, style: Style) -> Buffer {
+        let mut buf = Buffer::empty(Rect::new(0, 0, width, 1));
+        buf.set_string(0, 0, content, style);
+        buf
+    }
 
     #[test]
     fn empty_buffers_yield_no_diffs() {
@@ -257,6 +210,32 @@ mod tests {
         assert_eq!(diff, Vec::new());
     }
 
+    /// The diff never yields a continuation cell, whatever the transition: the wide glyph draws
+    /// those columns, and writing them would erase it.
+    #[test]
+    fn continuations_are_never_emitted() {
+        let rows = [
+            "你好，世界！",
+            "a❤️b漢c😀d",
+            "int value8;;",
+            "❤️❤️❤️❤️❤️❤️",
+            " 漢字 漢字 x",
+        ];
+        let styles = [Style::new(), Style::new().bg(Color::Blue)];
+        for (prev, next) in rows.iter().flat_map(|a| rows.iter().map(move |b| (a, b))) {
+            for (prev_style, next_style) in styles.iter().flat_map(|a| styles.map(|b| (a, b))) {
+                let prev = row(12, prev, *prev_style);
+                let next = row(12, next, next_style);
+                for (x, y, cell) in BufferDiff::new(&prev, &next) {
+                    assert!(
+                        !cell.is_continuation(),
+                        "{prev:?} -> {next:?} emitted a continuation at ({x}, {y})"
+                    );
+                }
+            }
+        }
+    }
+
     /// Regression for <https://github.com/ratatui/ratatui/issues/2685>: an image protocol cell
     /// keeps its whole escape sequence in one symbol, which measures hundreds of columns wide
     /// while covering a single column. Advancing the cursor by that width dropped every later
@@ -266,7 +245,9 @@ mod tests {
         let area = Rect::new(0, 0, 20, 5);
         let prev = Buffer::filled(area, Cell::new("S"));
         let mut next = Buffer::filled(area, Cell::new("L"));
-        next[(10, 0)].set_symbol(&"\u{1b}[s".repeat(400));
+        next.cell_mut((10, 0))
+            .unwrap()
+            .set_symbol(&"\u{1b}[s".repeat(400));
 
         let diff: Vec<_> = BufferDiff::new(&prev, &next).collect();
         assert_eq!(diff.len(), area.area() as usize);
@@ -280,49 +261,46 @@ mod tests {
         let mut prev = Buffer::filled(area, Cell::new("S"));
         let mut next = Buffer::filled(area, Cell::new("L"));
         let payload = "\u{1b}[s".repeat(400);
-        prev[(10, 0)].set_symbol(&payload);
-        next[(10, 0)].set_symbol(&payload);
+        prev.cell_mut((10, 0)).unwrap().set_symbol(&payload);
+        next.cell_mut((10, 0)).unwrap().set_symbol(&payload);
 
         let diff: Vec<_> = BufferDiff::new(&prev, &next).collect();
         assert_eq!(diff.len(), area.area() as usize - 1);
     }
 
-    /// A real wide glyph still hides its trailing cell: writing to the column covered by the
-    /// right half of the glyph would overwrite the glyph itself.
+    /// A style change on a continuation cell is not drawn: the glyph draws that column.
     #[test]
-    fn identical_wide_glyph_hides_trailing_cell_changes() {
-        use crate::style::Style;
-
-        let area = Rect::new(0, 0, 3, 1);
-        let mut prev = Buffer::empty(area);
-        prev.set_string(0, 0, "＋", Style::default());
-
+    fn continuation_style_change_is_not_emitted() {
+        let prev = row(3, "＋", Style::new());
         let mut next = prev.clone();
-        // Column 1 is occupied by the right half of `＋`.
-        next[(1, 0)].set_bg(Color::Red);
+        next.cell_mut((1, 0)).unwrap().set_bg(Color::Red);
 
         let diff: Vec<_> = BufferDiff::new(&prev, &next).collect();
+        assert!(diff.is_empty(), "got {diff:?}");
+    }
 
-        assert!(
-            diff.is_empty(),
-            "the hidden trailing cell of an unchanged wide glyph must not be emitted; got {diff:?}"
-        );
+    /// A glyph declared wider than its text covers the declared columns.
+    #[test]
+    fn declared_width_covers_columns() {
+        let prev = Buffer::with_lines(["abcd"]);
+        let mut next = Buffer::with_lines(["xbcd"]);
+        next.cell_mut((0, 0))
+            .unwrap()
+            .set_symbol_with_width("x", NonZeroU16::new(2).unwrap());
+
+        let diff: Vec<_> = BufferDiff::new(&prev, &next).collect();
+        assert_eq!(diff, [(0, 0, &next[(0, 0)])]);
     }
 
     /// Regression for <https://github.com/ratatui/ratatui/issues/2652>: removing a style that is
-    /// visible on blank cells from an unchanged wide glyph must clear its trailing column before
-    /// repainting the glyph. Clearing it afterwards can erase the glyph on some terminals.
+    /// visible on blank cells from an unchanged wide glyph must clear its other column before
+    /// repainting the glyph, for terminals that keep that column's attributes. Clearing it
+    /// afterwards can erase the glyph on some terminals.
     #[test]
     fn wide_glyph_style_change_clears_trailing_cell_before_repaint() {
-        use crate::style::Style;
-
-        let area = Rect::new(0, 0, 3, 1);
         for glyph in ["❤️", "😀"] {
-            let mut prev = Buffer::empty(area);
-            prev.set_string(0, 0, glyph, Style::new().bg(Color::Blue));
-
-            let mut next = Buffer::empty(area);
-            next.set_string(0, 0, glyph, Style::default());
+            let prev = row(3, glyph, Style::new().bg(Color::Blue));
+            let next = row(3, glyph, Style::new());
 
             let diff: Vec<_> = BufferDiff::new(&prev, &next).collect();
 
@@ -334,14 +312,8 @@ mod tests {
 
     #[test]
     fn wide_glyph_style_change_resumes_after_repaint() {
-        use crate::style::Style;
-
-        let area = Rect::new(0, 0, 3, 1);
-        let mut prev = Buffer::empty(area);
-        prev.set_string(0, 0, "한a", Style::new().bg(Color::Blue));
-
-        let mut next = Buffer::empty(area);
-        next.set_string(0, 0, "한b", Style::new().bg(Color::Red));
+        let prev = row(3, "한a", Style::new().bg(Color::Blue));
+        let next = row(3, "한b", Style::new().bg(Color::Red));
 
         let diff: Vec<_> = BufferDiff::new(&prev, &next).collect();
 
@@ -354,14 +326,8 @@ mod tests {
 
     #[test]
     fn wide_glyph_foreground_change_does_not_clear_trailing_cell() {
-        use crate::style::Style;
-
-        let area = Rect::new(0, 0, 3, 1);
-        let mut prev = Buffer::empty(area);
-        prev.set_string(0, 0, "한", Style::new().fg(Color::Blue));
-
-        let mut next = Buffer::empty(area);
-        next.set_string(0, 0, "한", Style::new().fg(Color::Red));
+        let prev = row(3, "한", Style::new().fg(Color::Blue));
+        let next = row(3, "한", Style::new().fg(Color::Red));
 
         let diff: Vec<_> = BufferDiff::new(&prev, &next).collect();
 
@@ -392,7 +358,9 @@ mod tests {
     fn skip_cells_are_skipped() {
         let prev = Buffer::with_lines(["abc"]);
         let mut next = Buffer::with_lines(["xyz"]);
-        next.content[1].diff_option = CellDiffOption::Skip;
+        next.cell_mut((1, 0))
+            .unwrap()
+            .set_diff_option(CellDiffOption::Skip);
 
         let diff: Vec<_> = BufferDiff::new(&prev, &next).collect();
         assert_eq!(diff.len(), 2);
@@ -403,10 +371,10 @@ mod tests {
     #[test]
     fn always_update_cells_are_emitted_even_when_identical() {
         let mut prev = Buffer::with_lines(["abc"]);
-        prev.content[1].diff_option = CellDiffOption::AlwaysUpdate;
-
-        let mut next = Buffer::with_lines(["abc"]);
-        next.content[1].diff_option = CellDiffOption::AlwaysUpdate;
+        prev.cell_mut((1, 0))
+            .unwrap()
+            .set_diff_option(CellDiffOption::AlwaysUpdate);
+        let next = prev.clone();
 
         let diff: Vec<_> = BufferDiff::new(&prev, &next).collect();
         assert_eq!(diff.len(), 1);
@@ -416,31 +384,14 @@ mod tests {
     }
 
     #[test]
-    fn forced_width_skips_trailing() {
-        let prev = Buffer::with_lines(["abcd"]);
-        let mut next = Buffer::with_lines(["xbcd"]);
-        next.content[0].diff_option = CellDiffOption::ForcedWidth(NonZeroU16::new(2).unwrap());
-
-        let diff: Vec<_> = BufferDiff::new(&prev, &next).collect();
-        assert_eq!(diff.len(), 1);
-        assert_eq!(diff[0].2.symbol(), "x");
-    }
-
-    #[test]
     fn vs16_trailing_cell_unchanged() {
-        use crate::style::{Color, Style};
-
-        let rect = Rect::new(0, 0, 4, 1);
-        let mut prev = Buffer::empty(rect);
-        prev.set_string(0, 0, "⌨️", Style::new());
+        let mut prev = row(4, "⌨️", Style::new());
         prev.set_string(2, 0, "ab", Style::new());
 
-        let mut next = Buffer::empty(rect);
-        next.set_string(0, 0, "⌨️", Style::new().fg(Color::Red));
+        let mut next = row(4, "⌨️", Style::new().fg(Color::Red));
         next.set_string(2, 0, "ab", Style::new());
 
-        // Only the main emoji cell (0,0) differs (different style);
-        // the trailing cell (1,0) is identical in both buffers.
+        // Only the emoji (0,0) differs (different style); its other column needs no clearing.
         let diff: Vec<_> = BufferDiff::new(&prev, &next).collect();
         assert_eq!(diff.len(), 1);
         assert_eq!(diff[0].0, 0);
@@ -461,54 +412,21 @@ mod tests {
         assert_eq!(diff, "xz");
     }
 
-    #[test]
-    #[allow(deprecated)]
-    fn forced_width_takes_precedence_over_deprecated_skip() {
-        let prev = Buffer::with_lines(["abcd"]);
-        let mut next = Buffer::with_lines(["xbcd"]);
-        next.content[0].skip = true;
-        next.content[0].diff_option = CellDiffOption::ForcedWidth(NonZeroU16::new(2).unwrap());
-
-        // ForcedWidth wins over skip=true, so the cell is diffed with forced width
-        let diff: CompactString = BufferDiff::new(&prev, &next)
-            .map(|(_, _, cell)| cell.symbol())
-            .collect();
-
-        assert_eq!(diff, "x");
-    }
-
     /// Regression test for the "uncovered trailing cell" bug.
     ///
     /// When a wide char with a non-default style (e.g. bg=Blue) is replaced by a narrow char,
-    /// its trailing cell was `reset()` in the buffer and therefore has default style in both
-    /// `prev` and `next`. The diff would skip it because symbol and style are identical.
-    ///
-    /// But the *terminal* rendered the trailing cell with the wide char's style (that's how
-    /// terminals work: printing "，" with bg=Blue paints both columns blue). So an explicit
-    /// update must be emitted even though the buffer cell looks unchanged.
+    /// the terminal still shows the wide char's style on the column it covered. The column is a
+    /// continuation in `prev` and a blank in `next`, so it is redrawn.
     ///
     /// With "你好，世界！" (Blue) replaced by "Hello" (default), "Hello" covers columns 0–4.
-    /// Columns 5, 7, 9, 11 are trailing cells of "，", "世", "界", "！" respectively — all
-    /// EMPTY in both buffers, but rendered blue on the terminal.
+    /// Columns 5, 7, 9, 11 were covered by "，", "世", "界", "！" respectively.
     #[test]
     fn uncovered_trailing_cells_emitted_when_wide_char_style_changes() {
-        use crate::style::{Color, Style};
-
-        // Width 12 fits exactly "你好，世界！" (6 wide chars × 2 cols each).
-        let rect = Rect::new(0, 0, 12, 1);
-        let mut prev = Buffer::empty(rect);
-        prev.set_string(0, 0, "你好，世界！", Style::new().bg(Color::Blue));
-
-        let mut next = Buffer::empty(rect);
-        next.set_string(0, 0, "Hello", Style::default());
+        let prev = row(12, "你好，世界！", Style::new().bg(Color::Blue));
+        let next = row(12, "Hello", Style::default());
 
         let diff: Vec<_> = BufferDiff::new(&prev, &next).collect();
 
-        // Columns 5, 7, 9, 11 are the trailing cells of "，", "世", "界", "！".
-        // Both prev and next hold EMPTY there (same symbol, same default style), but the
-        // previous cell did have a different style, so the terminal painted them blue.
-        // Without an explicit update the blue background is never cleared, producing
-        // "Hello ░ ░ ░ ░".
         for x in [5u16, 7, 9, 11] {
             assert!(
                 diff.iter().any(|(dx, dy, _)| *dx == x && *dy == 0),
@@ -519,109 +437,53 @@ mod tests {
 
     /// Regression for a multi-step scenario that produces "Hello  ░" artifacts.
     ///
-    /// "你好，世界！"(Blue) → "喵呜www"(Blue): "世"(cols 6-7) is replaced by "w"(Blue). Both
-    /// have the same background, so a guard like `previous.bg != current.bg` would not fire —
-    /// but the terminal painted col 7 (the trailing cell of "世") blue when it rendered the
-    /// wide char. Col 7 is EMPTY in both buffers, so without an explicit update the blue
-    /// lingers. A subsequent "Hello" draw then shows "Hello  ░" because "Hello" covers cols
-    /// 0-4, cols 5-6 are cleared (they held "ww"), but col 7 is never cleared.
+    /// "你好，世界！"(Blue) → "喵呜www"(Blue): "世"(cols 6-7) is replaced by "w"(Blue). Col 7,
+    /// covered by "世" before, must be cleared.
     #[test]
     fn uncovered_trailing_cells_emitted_when_wide_chars_partially_replaced() {
-        use crate::style::{Color, Style};
-
-        let rect = Rect::new(0, 0, 12, 1);
-        let mut prev = Buffer::empty(rect);
-        prev.set_string(0, 0, "你好，世界！", Style::new().bg(Color::Blue));
-
-        let mut next = Buffer::empty(rect);
-        next.set_string(0, 0, "喵呜www", Style::new().bg(Color::Blue));
+        let prev = row(12, "你好，世界！", Style::new().bg(Color::Blue));
+        let next = row(12, "喵呜www", Style::new().bg(Color::Blue));
 
         let diff: Vec<_> = BufferDiff::new(&prev, &next).collect();
 
-        // Col 7 is the trailing cell of "世"(6-7). "世" and its replacement "w" both have
-        // Blue bg, so a `previous.bg != current.bg` guard would not trigger — but the
-        // terminal painted it blue and it must be cleared.
         assert!(
             diff.iter().any(|(dx, dy, _)| *dx == 7 && *dy == 0),
             "expected update for trailing cell at x=7 (blue bg not cleared otherwise)"
         );
     }
 
+    /// Columns freed by a wide glyph are redrawn even when the glyph had no visible style: the
+    /// buffer does not assume what a terminal shows in a column whose glyph was overwritten.
     #[test]
-    fn no_force_update_when_wide_char_has_default_style() {
-        use crate::style::Style;
-
-        let rect = Rect::new(0, 0, 12, 1);
-        let mut prev = Buffer::empty(rect);
-        prev.set_string(0, 0, "你好，世界！", Style::default());
-
-        let mut next = Buffer::empty(rect);
-        next.set_string(0, 0, "Hello", Style::default());
+    fn freed_columns_are_redrawn() {
+        let prev = row(12, "你好，世界！", Style::default());
+        let next = row(12, "Hello", Style::default());
 
         let diff: Vec<_> = BufferDiff::new(&prev, &next).collect();
 
-        // Columns 5..=11 include the trailing cells of "，", "世", "界", "！".
-        // Both prev and next hold EMPTY there, and the previous wide chars had default style
-        // (bg=Reset, no visible modifier), so `force=true` is never set and trailing cells
-        // are not emitted.
-        for x in [5u16, 7, 9, 11] {
-            assert!(
-                !diff.iter().any(|(dx, dy, _)| *dx == x && *dy == 0),
-                "expected no update for trailing cell at x={x}"
-            );
-        }
+        let columns: Vec<u16> = diff.iter().map(|(x, _, _)| *x).collect();
+        assert_eq!(columns, (0..12).collect::<Vec<_>>());
     }
 
+    /// Regression for <https://github.com/ratatui/ratatui/issues/2585>: when a wide glyph is
+    /// replaced by narrower content, the column it covered must be redrawn.
     #[test]
     fn shrinking_wide_glyph_clears_trailing_cell() {
-        // Regression for https://github.com/ratatui/ratatui/issues/2585 (introduced by #1605):
-        // the cell-diff-options refactor dropped the classic `invalidated` counter, so when a
-        // multi-width glyph (here the full-width plus ＋, U+FF0B) is replaced by narrower content,
-        // the trailing cell it physically painted over was left un-cleared. Because that trailing
-        // cell is blank in both buffers (`current == previous`), only the previous glyph's width
-        // can force the redraw — exactly what `invalidated` tracks.
-
         let rect = Rect::new(0, 0, 2, 1);
-
-        let mut prev = Buffer::empty(rect);
-        prev.set_string(0, 0, "＋", crate::style::Style::new());
-        // Force some style that would leave artifacts (anything except foreground color).
+        let mut prev = row(2, "＋", Style::new());
         prev.cell_mut((0, 0)).unwrap().set_bg(Color::Red);
+        assert!(prev[(1, 0)].is_continuation());
 
-        assert_eq!(prev.content[0].symbol(), "＋");
-
-        // The trailing cell is reset to a blank space when the wide glyph is written.
-        assert_eq!(prev.content[1].symbol(), " ");
-
-        // Next frame clears the glyph: both cells are blank.
         let next = Buffer::empty(rect);
-        assert_eq!(next.content[1], prev.content[1]); // trailing cell is unchanged
-
         let diff: Vec<_> = BufferDiff::new(&prev, &next).collect();
 
-        assert_eq!(diff.len(), 2, "both columns must be redrawn, got {diff:?}");
-        assert_eq!((diff[0].0, diff[0].1), (0, 0));
-        assert_eq!(diff[0].2.symbol(), " ");
-
-        // The trailing cell (1,0) must be emitted even though it is identical in both buffers,
-        // otherwise the right half of the old glyph (and its background) lingers on screen.
-        assert_eq!((diff[1].0, diff[1].1), (1, 0));
-        assert_eq!(diff[1].2.symbol(), " ");
+        assert_eq!(diff, [(0, 0, &Cell::EMPTY), (1, 0, &Cell::EMPTY)]);
     }
 
     #[test]
     fn shrinking_wide_glyph_clears_trailing_background() {
-        use crate::style::{Color, Style};
-
-        // Same regression, framed as the reported symptom: a styled background painted across a
-        // wide glyph must be cleared from the trailing cell when the glyph shrinks away.
-
-        let rect = Rect::new(0, 0, 2, 1);
-
-        let mut prev = Buffer::empty(rect);
-        prev.set_string(0, 0, "＋", Style::new().bg(Color::Blue));
-
-        let next = Buffer::empty(rect); // blank, default background
+        let prev = row(2, "＋", Style::new().bg(Color::Blue));
+        let next = Buffer::empty(Rect::new(0, 0, 2, 1));
 
         let diff: Vec<_> = BufferDiff::new(&prev, &next).collect();
 
@@ -631,80 +493,44 @@ mod tests {
         );
     }
 
-    /// Regression: a non-blank cell inside the trailing range whose style changes between frames
-    /// must still be emitted.
-    ///
-    /// The trailing loop replaces the main loop for indices in `[i+1, i+prev_width)`. When
-    /// `force=true` every non-skip cell in the range is emitted unconditionally — not because the
-    /// style change is specifically detected, but because `force=true` short-circuits the check
-    /// entirely. This ensures style-only changes on trailing cells are never silently dropped.
-    ///
-    /// Scenario: widget A draws "你"(Blue) at col 0; widget B then writes "X"(Red) at col 1
-    /// (overriding the trailing reset). Next frame: widget A writes "a"(default), widget B writes
-    /// "X"(Green). Symbol at col 1 is unchanged, but fg changed Red→Green.
-    /// `force=true` fires because prev "你" had bg=Blue (visible on blank), so col 1 is emitted
-    /// regardless.
+    /// A cell written over the right half of a wide glyph replaces the glyph, and a later style
+    /// change on that cell is drawn.
     #[test]
-    fn trailing_range_cell_style_change_is_emitted() {
-        use crate::style::{Color, Style};
-
-        let rect = Rect::new(0, 0, 3, 1);
-        let mut prev = Buffer::empty(rect);
-        prev.set_string(0, 0, "你", Style::new().bg(Color::Blue));
-        // Widget B overrides the trailing reset at col 1.
-        prev.content[1]
+    fn cell_written_over_continuation_is_emitted() {
+        let mut prev = row(3, "你", Style::new().bg(Color::Blue));
+        prev.cell_mut((1, 0))
+            .unwrap()
             .set_symbol("X")
             .set_fg(Color::Red)
             .set_bg(Color::Reset);
 
-        let mut next = Buffer::empty(rect);
-        next.set_string(0, 0, "a", Style::default());
-        // Same symbol, different fg — style-only change.
-        next.content[1]
+        let mut next = row(3, "a", Style::default());
+        next.cell_mut((1, 0))
+            .unwrap()
             .set_symbol("X")
-            .set_fg(Color::Green)
-            .set_bg(Color::Reset);
+            .set_fg(Color::Green);
 
         let diff: Vec<_> = BufferDiff::new(&prev, &next).collect();
 
         assert!(
             diff.iter().any(|(x, y, _)| *x == 1 && *y == 0),
-            "col 1 style change (Red→Green) must be emitted even though symbol is unchanged; got {diff:?}"
+            "col 1 style change (Red→Green) must be emitted; got {diff:?}"
         );
     }
 
-    /// Regression: when the trailing loop emits a wide char, its own trailing column must be
-    /// skipped so the main loop does not write EMPTY there and corrupt the display.
-    ///
-    /// Scenario: prev="你好"(Blue) → next="a好"(Blue) where 'a' replaces '你'.
-    /// `force=true` is set (Blue bg), trailing range = [1, 2).
-    /// At j=1 the trailing loop finds '好' (width 2) in next and emits it.
-    /// Without the fix `next_index` advances to 2 = end; `self.pos` is set to 2.
-    /// The main loop then sees next[2]=EMPTY vs prev[2]='好'(Blue) and emits
-    /// EMPTY at col 2 — writing a space over the right half of the just-drawn '好'.
+    /// prev="你好"(Blue) → next="a好"(Blue): '好' moves to col 1, and col 2 is its continuation,
+    /// which must not receive a blank that would erase it.
     #[test]
-    fn trailing_range_wide_char_trailing_not_corrupted() {
-        use crate::style::{Color, Style};
-
-        let rect = Rect::new(0, 0, 4, 1);
-        let mut prev = Buffer::empty(rect);
-        prev.set_string(0, 0, "你好", Style::new().bg(Color::Blue));
-        // prev: [你(Blue)][EMPTY][好(Blue)][EMPTY]
-
-        let mut next = Buffer::empty(rect);
-        next.set_string(0, 0, "a", Style::new().bg(Color::Blue));
-        next.set_string(1, 0, "好", Style::new().bg(Color::Blue));
-        // next: [a(Blue)][好(Blue)][EMPTY][EMPTY]
+    fn moved_wide_glyph_continuation_is_not_overwritten() {
+        let prev = row(4, "你好", Style::new().bg(Color::Blue));
+        let next = row(4, "a好", Style::new().bg(Color::Blue));
 
         let diff: Vec<_> = BufferDiff::new(&prev, &next).collect();
 
-        // col 2 is the trailing cell of '好' in next; writing EMPTY there would
-        // overwrite the right half of '好' and corrupt the display.
         assert!(
             !diff.iter().any(|(x, y, _)| *x == 2 && *y == 0),
-            "trailing cell of '好' must not receive a spurious EMPTY write; got {diff:?}"
+            "continuation of '好' must not receive a write; got {diff:?}"
         );
-        // '好' itself must be emitted at col 1.
         assert!(
             diff.iter()
                 .any(|(x, y, cell)| *x == 1 && *y == 0 && cell.symbol() == "好"),
@@ -712,21 +538,19 @@ mod tests {
         );
     }
 
-    /// Regression for <https://github.com/ratatui/ratatui/issues/2695> (introduced by #2587):
-    /// the forced trailing range was not clamped to the buffer length, unlike the VS16 range
-    /// above it. With a wide glyph carrying a visible-on-blank style in the *last* cell of the
-    /// buffer, replaced by narrower content, the range extended one past the end and the
-    /// iterator panicked with an index out of bounds while being consumed (i.e. inside
-    /// `Terminal::flush`).
+    /// Regression for <https://github.com/ratatui/ratatui/issues/2695>: a wide glyph with a
+    /// visible style in the last cell of the buffer, replaced by narrower content, must not read
+    /// past the end of the buffer. The buffer clips the glyph to the one column it has.
     #[test]
     fn wide_glyph_in_last_cell_does_not_overrun_buffer() {
         let rect = Rect::new(0, 0, 3, 1);
         let mut prev = Buffer::empty(rect);
-        // set_string refuses to place a wide glyph in the last column, so write the cell
-        // directly — the path third-party widgets and direct cell access take.
-        prev.content[2].set_symbol("你").set_bg(Color::Red);
+        prev.cell_mut((2, 0))
+            .unwrap()
+            .set_symbol("你")
+            .set_bg(Color::Red);
         let mut next = Buffer::empty(rect);
-        next.content[2].set_symbol("a");
+        next.cell_mut((2, 0)).unwrap().set_symbol("a");
 
         let diff: Vec<_> = BufferDiff::new(&prev, &next).collect();
 
@@ -779,7 +603,8 @@ mod terminal_model {
 
     impl Column {
         fn from_symbol(symbol: &str) -> Self {
-            if symbol == " " {
+            // A continuation cell draws nothing of its own.
+            if symbol == " " || symbol.is_empty() {
                 Self::Blank
             } else {
                 Self::Glyph(symbol.to_string())
@@ -963,6 +788,29 @@ mod terminal_model {
         assert_no_artifacts_for_both_widths("ab", "❤️", 2);
         assert_no_artifacts_for_both_widths("abcd", "❤️cd", 4);
         assert_no_artifacts_for_both_widths("abcd", "ab❤️", 4);
+    }
+
+    /// A stale symbol (here a border) under the right half of a VS16 emoji used to be re-sent by
+    /// the diff, and broke the emoji. Writing the emoji makes that column a continuation, so the
+    /// border character is gone from the buffer and the emoji is drawn whole.
+    #[test]
+    fn vs16_emoji_over_stale_border_is_drawn_correctly() {
+        let prev = row(4, "────");
+        let mut next = row(4, "────");
+        next.cell_mut((0, 0)).unwrap().set_symbol("❤️");
+        assert!(next[(1, 0)].is_continuation());
+        for vs16_width in VS16_WIDTHS {
+            assert_no_artifacts(vs16_width, &prev, &next);
+        }
+        assert_eq!(
+            replay(Vs16Width::TwoColumns, &prev, &next),
+            [
+                Column::Glyph("❤️".into()),
+                Column::Continuation,
+                Column::Glyph("─".into()),
+                Column::Glyph("─".into()),
+            ]
+        );
     }
 
     /// Mixed rows: narrow, certain-width (`漢`, `😀`) and uncertain-width clusters interleaved.

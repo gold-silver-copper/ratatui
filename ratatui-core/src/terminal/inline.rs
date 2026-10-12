@@ -308,9 +308,12 @@ impl<B: Backend> Terminal<B> {
         let width: usize = self.last_known_area.width.into();
         let (to_draw, remainder) = cells.split_at(width * lines_to_draw as usize);
         if lines_to_draw > 0 {
+            // Continuation cells are drawn by the wide glyph to their left; writing them would
+            // erase it.
             let iter = to_draw
                 .iter()
                 .enumerate()
+                .filter(|(_, c)| !c.is_continuation())
                 .map(|(i, c)| ((i % width) as u16, y_offset + (i / width) as u16, c));
             self.backend.draw(iter)?;
             self.backend.flush()?;
@@ -503,6 +506,35 @@ mod tests {
         assert_eq!(terminal.backend().scrollback(), &scrollback);
     }
 
+    /// Lines inserted above the viewport keep their wide glyphs: the continuation cells behind
+    /// them are not drawn, which would erase them (fork issue #6).
+    #[test]
+    fn insert_before_keeps_wide_glyphs() {
+        let mut terminal = Terminal::with_options(
+            TestBackend::new(10, 6),
+            TerminalOptions {
+                viewport: Viewport::Inline(2),
+            },
+        )
+        .unwrap();
+
+        terminal
+            .insert_before(2, |buf| {
+                buf.set_string(0, 0, "你好，世界", Style::default());
+                buf.set_string(0, 1, "a漢b字", Style::default());
+            })
+            .unwrap();
+
+        terminal.backend().assert_buffer_lines([
+            "你好，世界",
+            "a漢b字    ",
+            "          ",
+            "          ",
+            "          ",
+            "          ",
+        ]);
+    }
+
     #[cfg(not(feature = "scrolling-regions"))]
     mod no_scrolling_regions {
         use super::*;
@@ -523,7 +555,7 @@ mod tests {
             let mut terminal = Terminal::new(TestBackend::new(3, 2)).unwrap();
             {
                 let frame = terminal.get_frame();
-                frame.buffer[(0, 0)].set_symbol("x");
+                frame.buffer.cell_mut((0, 0)).unwrap().set_symbol("x");
             }
             terminal.flush().unwrap();
 

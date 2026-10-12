@@ -452,7 +452,11 @@ mod tests {
         let completed = terminal
             .draw(|frame| {
                 // Ensure the frame produces updates so `Terminal::flush` writes to the backend.
-                frame.buffer_mut()[(0, 0)] = Cell::new("x");
+                frame
+                    .buffer_mut()
+                    .cell_mut((0, 0))
+                    .unwrap()
+                    .set_cell(&Cell::new("x"));
             })
             .unwrap();
 
@@ -491,7 +495,11 @@ mod tests {
             .draw(|frame| {
                 // The cursor is applied after the frame is flushed.
                 frame.set_cursor_position(Position { x: 2, y: 1 });
-                frame.buffer_mut()[(1, 0)] = Cell::new("y");
+                frame
+                    .buffer_mut()
+                    .cell_mut((1, 0))
+                    .unwrap()
+                    .set_cell(&Cell::new("y"));
             })
             .unwrap();
 
@@ -569,7 +577,11 @@ mod tests {
         terminal
             .draw(|frame| {
                 // Render a marker to show we rendered after the clear.
-                frame.buffer_mut()[(0, 0)] = Cell::new("x");
+                frame
+                    .buffer_mut()
+                    .cell_mut((0, 0))
+                    .unwrap()
+                    .set_cell(&Cell::new("x"));
             })
             .unwrap();
 
@@ -611,7 +623,11 @@ mod tests {
                     "frame area matches the configured fixed viewport"
                 );
                 let area = frame.area();
-                frame.buffer_mut()[(area.x, area.y)] = Cell::new("z");
+                frame
+                    .buffer_mut()
+                    .cell_mut((area.x, area.y))
+                    .unwrap()
+                    .set_cell(&Cell::new("z"));
             })
             .unwrap();
 
@@ -648,7 +664,11 @@ mod tests {
                         viewport_area,
                         "inline frame area matches the computed viewport"
                     );
-                    frame.buffer_mut()[(viewport_area.x, viewport_area.y)] = Cell::new("i");
+                    frame
+                        .buffer_mut()
+                        .cell_mut((viewport_area.x, viewport_area.y))
+                        .unwrap()
+                        .set_cell(&Cell::new("i"));
                 })
                 .unwrap();
 
@@ -694,7 +714,11 @@ mod tests {
                     x: area.x,
                     y: area.y.saturating_add(1),
                 });
-                frame.buffer_mut()[(area.x, area.y)] = Cell::new("a");
+                frame
+                    .buffer_mut()
+                    .cell_mut((area.x, area.y))
+                    .unwrap()
+                    .set_cell(&Cell::new("a"));
             })
             .unwrap();
 
@@ -705,7 +729,11 @@ mod tests {
         terminal
             .draw(|frame| {
                 let area = frame.area();
-                frame.buffer_mut()[(area.x, area.y)] = Cell::new("g");
+                frame
+                    .buffer_mut()
+                    .cell_mut((area.x, area.y))
+                    .unwrap()
+                    .set_cell(&Cell::new("g"));
             })
             .unwrap();
 
@@ -758,7 +786,11 @@ mod tests {
                     x: area.x,
                     y: area.y.saturating_add(2),
                 });
-                frame.buffer_mut()[(area.x, area.y)] = Cell::new("a");
+                frame
+                    .buffer_mut()
+                    .cell_mut((area.x, area.y))
+                    .unwrap()
+                    .set_cell(&Cell::new("a"));
             })
             .unwrap();
 
@@ -768,7 +800,11 @@ mod tests {
         terminal
             .draw(|frame| {
                 let area = frame.area();
-                frame.buffer_mut()[(area.x, area.y)] = Cell::new("s");
+                frame
+                    .buffer_mut()
+                    .cell_mut((area.x, area.y))
+                    .unwrap()
+                    .set_cell(&Cell::new("s"));
             })
             .unwrap();
 
@@ -802,7 +838,11 @@ mod tests {
             // `CompletedFrame` borrows the terminal, and is only valid until the next draw call.
             let first = terminal
                 .draw(|frame| {
-                    frame.buffer_mut()[(0, 0)] = Cell::new("a");
+                    frame
+                        .buffer_mut()
+                        .cell_mut((0, 0))
+                        .unwrap()
+                        .set_cell(&Cell::new("a"));
                 })
                 .unwrap();
 
@@ -816,7 +856,11 @@ mod tests {
 
         let second = terminal
             .draw(|frame| {
-                frame.buffer_mut()[(0, 0)] = Cell::new("b");
+                frame
+                    .buffer_mut()
+                    .cell_mut((0, 0))
+                    .unwrap()
+                    .set_cell(&Cell::new("b"));
             })
             .unwrap();
 
@@ -838,7 +882,10 @@ mod tests {
 
         let mut external_buffer = Buffer::default();
         external_buffer.resize(terminal.get_frame().area());
-        external_buffer[(0, 0)] = Cell::new("b");
+        external_buffer
+            .cell_mut((0, 0))
+            .unwrap()
+            .set_cell(&Cell::new("b"));
 
         terminal.current_buffer_mut().merge(&external_buffer);
         let completed = terminal.apply_buffer().unwrap();

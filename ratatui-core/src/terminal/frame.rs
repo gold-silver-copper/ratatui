@@ -134,7 +134,9 @@ impl Frame<'_> {
     ///
     ///     fn render(self, area: Rect, buf: &mut Buffer, state: &mut Self::State) {
     ///         let symbol = if *state { "Y" } else { "N" };
-    ///         buf[(area.x, area.y)].set_symbol(symbol);
+    ///         if let Some(mut cell) = buf.cell_mut(area.as_position()) {
+    ///             cell.set_symbol(symbol);
+    ///         }
     ///     }
     /// }
     ///
@@ -202,7 +204,9 @@ impl Frame<'_> {
     /// # let backend = TestBackend::new(5, 1);
     /// # let mut terminal = Terminal::new(backend).unwrap();
     /// # let mut frame = terminal.get_frame();
-    /// frame.buffer_mut()[(0, 0)].set_symbol("h");
+    /// if let Some(mut cell) = frame.buffer_mut().cell_mut((0, 0)) {
+    ///     cell.set_symbol("h");
+    /// }
     /// ```
     pub const fn buffer_mut(&mut self) -> &mut Buffer {
         self.buffer

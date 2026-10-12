@@ -198,7 +198,9 @@ impl Widget for &mut ColorsWidget {
                 // pixel below it
                 let fg = colors[yi * 2][xi];
                 let bg = colors[yi * 2 + 1][xi];
-                buf[Position::new(x, y)].set_char('▀').set_fg(fg).set_bg(bg);
+                if let Some(mut cell) = buf.cell_mut(Position::new(x, y)) {
+                    cell.set_char('▀').set_fg(fg).set_bg(bg);
+                }
             }
         }
         self.frame_count += 1;

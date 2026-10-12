@@ -236,7 +236,7 @@ mod tests {
         // Put visible content on the backend so we can tell whether a clear happened.
         {
             let frame = terminal.get_frame();
-            frame.buffer[(0, 0)].set_symbol("x");
+            frame.buffer.cell_mut((0, 0)).unwrap().set_symbol("x");
         }
         terminal.flush().unwrap();
         terminal.backend().assert_buffer_lines(["x  ", "   "]);
@@ -261,7 +261,7 @@ mod tests {
 
         {
             let frame = terminal.get_frame();
-            frame.buffer[(0, 0)].set_symbol("x");
+            frame.buffer.cell_mut((0, 0)).unwrap().set_symbol("x");
         }
         terminal.flush().unwrap();
 

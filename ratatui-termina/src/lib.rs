@@ -528,10 +528,9 @@ where
 
 #[cfg(test)]
 mod tests {
-    use std::num::NonZeroU16;
     use std::time::Duration;
 
-    use ratatui_core::buffer::{Cell, CellDiffOption};
+    use ratatui_core::buffer::Cell;
     use termina::EventReader;
     use termina::escape::csi::Csi;
 
@@ -819,10 +818,10 @@ mod tests {
     #[test]
     fn moves_cursor_when_previous_width_overflows() {
         let mut backend = backend();
-        let mut forced = Cell::new("a");
-        forced.set_diff_option(CellDiffOption::ForcedWidth(NonZeroU16::MAX));
+        // A wide glyph at the last representable column: its end overflows u16.
+        let wide = Cell::new("界");
         let next = Cell::new("b");
-        let content = [(1, 0, &forced), (0, 0, &next)];
+        let content = [(u16::MAX - 1, 0, &wide), (0, 0, &next)];
 
         backend.draw(content.into_iter()).unwrap();
 

@@ -470,7 +470,9 @@ fn render_line(wrapped: &WrappedLine<'_, '_>, area: Rect, buf: &mut Buffer, y: u
         // Make sure to overwrite any previous character with a space (rather than a zero-width)
         let symbol = if symbol.is_empty() { " " } else { symbol };
         let position = Position::new(area.left() + x, area.top() + y);
-        buf[position].set_symbol(symbol).set_style(*style);
+        if let Some(mut cell) = buf.cell_mut(position) {
+            cell.set_symbol(symbol).set_style(*style);
+        }
         x += width;
     }
 }

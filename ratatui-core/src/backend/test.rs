@@ -3,11 +3,10 @@
 
 use alloc::string::String;
 use alloc::vec;
-use core::fmt::{self, Write};
-use core::iter;
+use core::{fmt, iter};
 
 use crate::backend::{Backend, ClearType, WindowSize};
-use crate::buffer::{Buffer, Cell, CellWidth};
+use crate::buffer::{Buffer, Cell};
 use crate::layout::{Position, Rect, Size};
 
 /// A [`Backend`] implementation used for integration testing that renders to an memory buffer.
@@ -42,28 +41,15 @@ pub struct TestBackend {
 ///
 /// This function is used to visualize the buffer content in a human-readable format.
 /// It iterates through the buffer content and appends each cell's symbol to the view string.
-/// If a cell is hidden by a multi-width symbol, it is added to the overwritten vector and
-/// displayed at the end of the line.
+/// Continuation cells of wide glyphs have no symbol, so each row shows what a terminal shows.
 fn buffer_view(buffer: &Buffer) -> String {
     let mut view = String::with_capacity(buffer.content.len() + buffer.area.height as usize * 3);
     for cells in buffer.content.chunks(buffer.area.width as usize) {
-        let mut overwritten = vec![];
-        let mut skip: u16 = 0;
         view.push('"');
-        for (x, c) in cells.iter().enumerate() {
-            let sym = c.symbol();
-            if skip == 0 {
-                view.push_str(sym);
-            } else {
-                overwritten.push((x, sym));
-            }
-            skip = core::cmp::max(skip, c.cell_width()).saturating_sub(1);
+        for cell in cells {
+            view.push_str(cell.symbol());
         }
-        view.push('"');
-        if !overwritten.is_empty() {
-            write!(&mut view, " Hidden by multi-width symbols: {overwritten:?}").unwrap();
-        }
-        view.push('\n');
+        view.push_str("\"\n");
     }
     view
 }
@@ -265,7 +251,9 @@ impl Backend for TestBackend {
         I: Iterator<Item = (u16, u16, &'a Cell)>,
     {
         for (x, y, c) in content {
-            self.buffer[(x, y)] = c.clone();
+            if let Some(mut cell) = self.buffer.cell_mut((x, y)) {
+                cell.set_cell(c);
+            }
         }
         Ok(())
     }
@@ -308,29 +296,23 @@ impl Backend for TestBackend {
     }
 
     fn clear_region(&mut self, clear_type: ClearType) -> Result<()> {
+        let cursor = || self.buffer.index_of(self.pos.0, self.pos.1);
+        let line_start = || self.buffer.index_of(0, self.pos.1);
+        let line_end = || line_start() + usize::from(self.buffer.area.width);
         let region = match clear_type {
             ClearType::All => return self.clear(),
-            ClearType::AfterCursor => {
-                let index = self.buffer.index_of(self.pos.0, self.pos.1);
-                &mut self.buffer.content[index..]
-            }
-            ClearType::BeforeCursor => {
-                let index = self.buffer.index_of(self.pos.0, self.pos.1);
-                &mut self.buffer.content[..=index]
-            }
-            ClearType::CurrentLine => {
-                let line_start_index = self.buffer.index_of(0, self.pos.1);
-                let line_end_index = self.buffer.index_of(self.buffer.area.width - 1, self.pos.1);
-                &mut self.buffer.content[line_start_index..=line_end_index]
-            }
-            ClearType::UntilNewLine => {
-                let index = self.buffer.index_of(self.pos.0, self.pos.1);
-                let line_end_index = self.buffer.index_of(self.buffer.area.width - 1, self.pos.1);
-                &mut self.buffer.content[index..=line_end_index]
-            }
+            ClearType::AfterCursor => cursor()..self.buffer.content.len(),
+            ClearType::BeforeCursor => 0..cursor() + 1,
+            ClearType::CurrentLine => line_start()..line_end(),
+            ClearType::UntilNewLine => cursor()..line_end(),
         };
-        for cell in region {
-            cell.reset();
+        // Clear cell by cell: clearing part of a wide glyph clears the whole glyph, as in a
+        // terminal.
+        for index in region {
+            let (x, y) = self.buffer.pos_of(index);
+            if let Some(mut cell) = self.buffer.cell_mut((x, y)) {
+                cell.reset();
+            }
         }
         Ok(())
     }
@@ -516,13 +498,13 @@ mod tests {
     }
 
     #[test]
-    fn buffer_view_with_overwrites() {
+    fn buffer_view_with_wide_glyph() {
         let multi_byte_char = "👨‍👩‍👧‍👦"; // renders 2 wide
         let buffer = Buffer::with_lines([multi_byte_char]);
         assert_eq!(
             buffer_view(&buffer),
             format!(
-                r#""{multi_byte_char}" Hidden by multi-width symbols: [(1, " ")]
+                r#""{multi_byte_char}"
 "#,
             )
         );

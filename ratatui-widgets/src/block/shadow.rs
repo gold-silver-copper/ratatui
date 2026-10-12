@@ -51,8 +51,10 @@ use ratatui_core::widgets::Widget;
 ///                 if base_area.contains(Position { x, y }) {
 ///                     continue;
 ///                 }
-///                 if (x + y) % 2 == 0 {
-///                     buf[(x, y)].set_symbol("░");
+///                 if (x + y) % 2 == 0
+///                     && let Some(mut cell) = buf.cell_mut((x, y))
+///                 {
+///                     cell.set_symbol("░");
 ///                 }
 ///             }
 ///         }
@@ -99,7 +101,9 @@ impl Effect {
             Self::Overlay => {}
             Self::Symbol(symbol) => {
                 for_each_shadow_cell(shadow_area, base_area, buf, |x, y, buf| {
-                    buf[(x, y)].set_symbol(symbol);
+                    if let Some(mut cell) = buf.cell_mut((x, y)) {
+                        cell.set_symbol(symbol);
+                    }
                 });
             }
             Self::Custom(filter) => filter.apply(shadow_area, base_area, buf),
@@ -320,7 +324,9 @@ impl Widget for &Shadow {
                 if area.contains(Position { x, y }) {
                     continue;
                 }
-                buf[(x, y)].set_style(self.style);
+                if let Some(mut cell) = buf.cell_mut((x, y)) {
+                    cell.set_style(self.style);
+                }
             }
         }
 
@@ -339,11 +345,12 @@ pub struct Dimmed;
 impl CellEffect for Dimmed {
     fn apply(&self, shadow_area: Rect, base_area: Rect, buf: &mut Buffer) {
         for_each_shadow_cell(shadow_area, base_area, buf, |x, y, buf| {
-            buf[(x, y)].modifier.insert(Modifier::DIM);
-            if let Color::Rgb(r, g, b) = buf[(x, y)].bg {
-                buf[(x, y)].bg = Color::Rgb(r / 2, g / 2, b / 2);
-            } else {
-                buf[(x, y)].bg = Color::Black;
+            if let Some(mut cell) = buf.cell_mut((x, y)) {
+                let bg = match cell.bg {
+                    Color::Rgb(r, g, b) => Color::Rgb(r / 2, g / 2, b / 2),
+                    _ => Color::Black,
+                };
+                cell.set_style(Style::new().bg(bg).add_modifier(Modifier::DIM));
             }
         });
     }
@@ -436,7 +443,7 @@ mod tests {
         impl CellEffect for PlusFilter {
             fn apply(&self, shadow_area: Rect, base_area: Rect, buf: &mut Buffer) {
                 for_each_shadow_cell(shadow_area, base_area, buf, |x, y, buf| {
-                    buf[(x, y)].set_symbol("+");
+                    buf.cell_mut((x, y)).unwrap().set_symbol("+");
                 });
             }
         }

@@ -1,13 +1,16 @@
 use alloc::vec;
 use alloc::vec::Vec;
-use core::ops::{Index, IndexMut};
-use core::{cmp, fmt};
+use core::fmt;
+use core::num::NonZeroU16;
+use core::ops::{Deref, Index};
 
 use unicode_segmentation::UnicodeSegmentation;
 
-use crate::buffer::{BufferDiff, Cell, CellWidth};
+use crate::buffer::cell::Span as CellSpan;
+use crate::buffer::{BufferDiff, Cell, CellDiffOption, CellWidth};
 use crate::layout::{Position, Rect};
-use crate::style::Style;
+use crate::style::{Color, Style};
+use crate::symbols::merge::MergeStrategy;
 use crate::text::{Line, Span};
 
 /// A buffer that maps to the desired content of the terminal after the draw call
@@ -32,22 +35,21 @@ use crate::text::{Line, Span};
 ///     height: 5,
 /// });
 ///
-/// // indexing using Position
-/// buf[Position { x: 0, y: 0 }].set_symbol("A");
-/// assert_eq!(buf[Position { x: 0, y: 0 }].symbol(), "A");
+/// // writing a cell; `None` if the position is outside the buffer
+/// buf.cell_mut(Position { x: 0, y: 0 })
+///     .ok_or("cell not found")?
+///     .set_symbol("A");
+/// buf.cell_mut((0, 1))
+///     .ok_or("cell not found")?
+///     .set_symbol("B");
 ///
-/// // indexing using (x, y) tuple (which is converted to Position)
-/// buf[(0, 1)].set_symbol("B");
+/// // reading a cell by indexing with a Position or an (x, y) tuple
+/// assert_eq!(buf[Position { x: 0, y: 0 }].symbol(), "A");
 /// assert_eq!(buf[(0, 1)].symbol(), "B");
 ///
 /// // getting an Option instead of panicking if the position is outside the buffer
-/// let cell = buf
-///     .cell_mut(Position { x: 0, y: 2 })
-///     .ok_or("cell not found")?;
-/// cell.set_symbol("C");
-///
-/// let cell = buf.cell(Position { x: 0, y: 2 }).ok_or("cell not found")?;
-/// assert_eq!(cell.symbol(), "C");
+/// let cell = buf.cell(Position { x: 0, y: 1 }).ok_or("cell not found")?;
+/// assert_eq!(cell.symbol(), "B");
 ///
 /// buf.set_string(
 ///     3,
@@ -62,14 +64,46 @@ use crate::text::{Line, Span};
 /// # Ok(())
 /// # }
 /// ```
+///
+/// # Wide glyphs
+///
+/// A glyph wider than one column, such as `界` or `❤️`, is stored in the cell where it starts.
+/// The other columns it covers hold [continuation](Cell::is_continuation) cells, which have no
+/// symbol of their own and are never drawn. Every write goes through the buffer, which keeps
+/// that true:
+///
+/// - Writing a wide glyph makes the cells it covers continuations, up to the end of the row.
+/// - Writing over any part of a wide glyph (its first cell or a continuation) removes the whole
+///   glyph: its other cells become blanks that keep their style, as in a terminal.
+/// - A wide glyph has one style, shared by its continuation cells. Styling its first cell styles
+///   the glyph; styling a continuation cell does nothing.
+///
+/// That is why the buffer hands out a [`CellMut`] rather than a `&mut Cell`.
+///
+/// ```
+/// use ratatui_core::buffer::Buffer;
+/// use ratatui_core::layout::Rect;
+/// use ratatui_core::style::Style;
+///
+/// let mut buf = Buffer::empty(Rect::new(0, 0, 4, 1));
+/// buf.set_string(0, 0, "界", Style::new());
+/// assert!(buf[(1, 0)].is_continuation());
+///
+/// // Writing over the right half of `界` removes the whole glyph.
+/// buf.cell_mut((1, 0)).unwrap().set_symbol("a");
+/// assert_eq!(buf, Buffer::with_lines([" a  "]));
+/// ```
 #[derive(Default, Clone, Eq, PartialEq, Hash)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct Buffer {
     /// The area represented by this buffer
     pub area: Rect,
-    /// The content of the buffer. The length of this Vec should always be equal to area.width *
-    /// area.height
-    pub content: Vec<Cell>,
+    /// The content of the buffer, row by row. Its length is always `area.width * area.height`.
+    ///
+    /// Private so that writes go through the buffer, which keeps continuation cells next to the
+    /// wide glyphs they belong to. Code in this crate may move, copy or clear whole rows, which
+    /// keeps that true; anything else must use [`Buffer::cell_mut`].
+    pub(crate) content: Vec<Cell>,
 }
 
 impl Buffer {
@@ -80,11 +114,25 @@ impl Buffer {
     }
 
     /// Returns a Buffer with all cells initialized with the attributes of the given Cell
+    ///
+    /// A wide `cell` is repeated every `width` columns, with continuation cells in between. A
+    /// continuation `cell` has nothing to draw and gives an empty buffer.
     #[must_use]
     pub fn filled(area: Rect, cell: Cell) -> Self {
-        let size = area.area() as usize;
-        let content = vec![cell; size];
-        Self { area, content }
+        if cell.is_continuation() {
+            return Self::empty(area);
+        }
+        if cell.columns() == 1 {
+            let content = vec![cell; area.area() as usize];
+            return Self { area, content };
+        }
+        let mut buffer = Self::empty(area);
+        for y in area.top()..area.bottom() {
+            for x in (area.left()..area.right()).step_by(usize::from(cell.columns())) {
+                buffer.write(Position { x, y }, |c| *c = cell.clone());
+            }
+        }
+        buffer
     }
 
     /// Returns a Buffer containing the given lines
@@ -133,26 +181,6 @@ impl Buffer {
         &self.content[i]
     }
 
-    /// Returns a mutable reference to the [`Cell`] at the given coordinates.
-    ///
-    /// Callers should use [`Buffer[]`](Self::index_mut) or [`Buffer::cell_mut`] instead of this
-    /// method.
-    ///
-    /// Note: idiomatically methods named `get_mut` usually return `Option<&mut T>`, but this method
-    /// panics instead. This is kept for backwards compatibility. See [`cell_mut`](Self::cell_mut)
-    /// for a safe alternative.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the position is outside the `Buffer`'s area.
-    #[track_caller]
-    #[deprecated = "use `Buffer[(x, y)]` instead. To avoid panicking, use `Buffer::cell_mut((x, y))`. Both methods take `impl Into<Position>`."]
-    #[must_use]
-    pub fn get_mut(&mut self, x: u16, y: u16) -> &mut Cell {
-        let i = self.index_of(x, y);
-        &mut self.content[i]
-    }
-
     /// Returns a reference to the [`Cell`] at the given position or [`None`] if the position is
     /// outside the `Buffer`'s area.
     ///
@@ -182,14 +210,15 @@ impl Buffer {
         self.content.get(index)
     }
 
-    /// Returns a mutable reference to the [`Cell`] at the given position or [`None`] if the
+    /// Returns a [`CellMut`] for writing the [`Cell`] at the given position, or [`None`] if the
     /// position is outside the `Buffer`'s area.
     ///
     /// This method accepts any value that can be converted to [`Position`] (e.g. `(x, y)` or
     /// `Position::new(x, y)`).
     ///
-    /// For a method that panics when the position is outside the buffer instead of returning
-    /// `None`, use [`Buffer[]`](Self::index_mut).
+    /// The buffer does not hand out `&mut Cell`: changing a cell's symbol can change how many
+    /// columns it covers, and the buffer has to update the neighbouring cells to match. See
+    /// [wide glyphs](Buffer#wide-glyphs).
     ///
     /// # Examples
     ///
@@ -199,18 +228,80 @@ impl Buffer {
     /// use ratatui_core::style::{Color, Style};
     /// let mut buffer = Buffer::empty(Rect::new(0, 0, 10, 10));
     ///
-    /// if let Some(cell) = buffer.cell_mut(Position::new(0, 0)) {
-    ///     cell.set_symbol("A");
+    /// if let Some(mut cell) = buffer.cell_mut(Position::new(0, 0)) {
+    ///     cell.set_symbol("A")
+    ///         .set_style(Style::default().fg(Color::Red));
     /// }
-    /// if let Some(cell) = buffer.cell_mut((0, 0)) {
-    ///     cell.set_style(Style::default().fg(Color::Red));
-    /// }
+    /// assert_eq!(buffer[(0, 0)].symbol(), "A");
+    /// assert!(buffer.cell_mut((10, 10)).is_none());
     /// ```
     #[must_use]
-    pub fn cell_mut<P: Into<Position>>(&mut self, position: P) -> Option<&mut Cell> {
-        let position = position.into();
-        let index = self.index_of_opt(position)?;
-        self.content.get_mut(index)
+    pub fn cell_mut<P: Into<Position>>(&mut self, position: P) -> Option<CellMut<'_>> {
+        let index = self.index_of_opt(position.into())?;
+        Some(CellMut {
+            buffer: self,
+            index,
+        })
+    }
+
+    /// Writes the cell at `position` with `update`, which must leave it drawing a glyph, and
+    /// keeps the cells around it consistent. Positions outside the buffer are ignored.
+    ///
+    /// This is the one place that changes how many columns a glyph covers:
+    ///
+    /// - If the cell was covered by a wide glyph, that glyph's cells to the left become blank.
+    /// - The cells the new glyph covers become its continuations, clipped to the row; a glyph cut
+    ///   short by the edge of the buffer declares the columns it kept.
+    /// - Continuations right after the new glyph belonged to a glyph it overwrote, and become
+    ///   blank.
+    fn write(&mut self, position: Position, update: impl FnOnce(&mut Cell)) {
+        self.write_measured(position, None, update);
+    }
+
+    /// [`write`](Self::write), for a caller that already measured the new glyph's width.
+    fn write_measured(
+        &mut self,
+        position: Position,
+        measured: Option<u16>,
+        update: impl FnOnce(&mut Cell),
+    ) {
+        let Some(index) = self.index_of_opt(position) else {
+            return;
+        };
+        let width = usize::from(self.area.width);
+        let row_end = index - index % width + width;
+
+        if self.content[index].is_continuation() {
+            let row_start = index - index % width;
+            let anchor = self.content[row_start..index]
+                .iter()
+                .rposition(|cell| !cell.is_continuation())
+                .map_or(row_start, |offset| row_start + offset);
+            for cell in &mut self.content[anchor..index] {
+                cell.make_blank();
+            }
+        }
+
+        let anchor = &mut self.content[index];
+        update(anchor);
+        let columns = usize::from(measured.map_or_else(|| anchor.columns(), |width| width.max(1)));
+        let end = (index + columns).min(row_end);
+        if end - index < columns {
+            // `end - index` is at least one and at most the buffer width.
+            if let Some(kept) = NonZeroU16::new((end - index) as u16) {
+                anchor.set_span(CellSpan::Fixed(kept));
+            }
+        }
+        let style = anchor.style();
+        for cell in &mut self.content[index + 1..end] {
+            cell.make_continuation(style);
+        }
+        for cell in self.content[end..row_end]
+            .iter_mut()
+            .take_while(|cell| cell.is_continuation())
+        {
+            cell.make_blank();
+        }
     }
 
     /// Returns the index in the `Vec<Cell>` for the given global (x, y) coordinates.
@@ -357,14 +448,10 @@ impl Buffer {
             });
         let style = style.into();
         for (symbol, width) in graphemes {
-            self[(x, y)].set_symbol(symbol).set_style(style);
-            let next_symbol = x + width;
-            x += 1;
-            // Reset following cells if multi-width (they would be hidden by the grapheme),
-            while x < next_symbol {
-                self[(x, y)].reset();
-                x += 1;
-            }
+            self.write_measured(Position { x, y }, Some(width), |cell| {
+                cell.set_symbol(symbol).set_style(style);
+            });
+            x += width;
         }
         (x, y)
     }
@@ -405,23 +492,48 @@ impl Buffer {
     pub fn set_style<S: Into<Style>>(&mut self, area: Rect, style: S) {
         let style = style.into();
         let area = self.area.intersection(area);
-        for y in area.top()..area.bottom() {
-            for x in area.left()..area.right() {
-                self[(x, y)].set_style(style);
-            }
+        for position in area.positions() {
+            self.style_glyph(position, style);
+        }
+    }
+
+    /// Patches the style of the glyph starting at `position` and of its continuation cells,
+    /// which always share the style of their glyph. Does nothing on a continuation cell.
+    fn style_glyph(&mut self, position: Position, style: Style) {
+        let Some(index) = self.index_of_opt(position) else {
+            return;
+        };
+        let (anchor, rest) = self.content[index..].split_at_mut(1);
+        let anchor = &mut anchor[0];
+        if anchor.is_continuation() {
+            return;
+        }
+        anchor.set_style(style);
+        let style = anchor.style();
+        let row_end = usize::from(self.area.width) - index % usize::from(self.area.width) - 1;
+        for cell in rest[..row_end]
+            .iter_mut()
+            .take_while(|cell| cell.is_continuation())
+        {
+            cell.make_continuation(style);
         }
     }
 
     /// Resize the buffer so that the mapped area matches the given area and that the buffer
     /// length is equal to area.width * area.height
+    ///
+    /// Cells keep their offset from the top-left corner of the area. A wide glyph cut by the new
+    /// right edge is clipped.
     pub fn resize(&mut self, area: Rect) {
-        let length = area.area() as usize;
-        if self.content.len() > length {
-            self.content.truncate(length);
-        } else {
-            self.content.resize(length, Cell::EMPTY);
+        if area.width == self.area.width {
+            self.content.resize(area.area() as usize, Cell::EMPTY);
+            self.area = area;
+            return;
         }
-        self.area = area;
+        let mut old = core::mem::replace(self, Self::empty(area));
+        old.area.x = area.x;
+        old.area.y = area.y;
+        self.copy_from(&old);
     }
 
     /// Reset all cells in the buffer
@@ -432,32 +544,39 @@ impl Buffer {
     }
 
     /// Merge an other buffer into this one
+    ///
+    /// The result covers both areas. Cells of `other` are written over this buffer's cells.
     pub fn merge(&mut self, other: &Self) {
         let area = self.area.union(other.area);
-        self.content.resize(area.area() as usize, Cell::EMPTY);
+        let old = core::mem::replace(self, Self::empty(area));
+        self.copy_from(&old);
+        self.copy_from(other);
+    }
 
-        // Move original content to the appropriate space
-        let size = self.area.area() as usize;
-        for i in (0..size).rev() {
-            let (x, y) = self.pos_of(i);
-            // New index in content
-            let k = ((y - area.y) * area.width + x - area.x) as usize;
-            if i != k {
-                self.content[k] = self.content[i].clone();
-                self.content[i].reset();
+    /// Appends `symbol`, typically a zero-width grapheme, to the glyph covering `position`.
+    pub(crate) fn append_symbol(&mut self, position: Position, symbol: &str, style: Style) {
+        let Some(index) = self.index_of_opt(position) else {
+            return;
+        };
+        let row_start = index - index % usize::from(self.area.width);
+        let anchor = self.content[row_start..=index]
+            .iter()
+            .rposition(|cell| !cell.is_continuation())
+            .map_or(index, |offset| row_start + offset);
+        let (x, y) = self.pos_of(anchor);
+        self.write(Position { x, y }, |cell| {
+            cell.append_symbol(symbol).set_style(style);
+        });
+    }
+
+    /// Writes every glyph of `other` to the same position in this buffer.
+    fn copy_from(&mut self, other: &Self) {
+        let positions = other.area.positions();
+        for (position, cell) in positions.zip(&other.content) {
+            if !cell.is_continuation() {
+                self.write(position, |c| c.clone_from(cell));
             }
         }
-
-        // Push content of the other buffer into this one (may erase previous
-        // data)
-        let size = other.area.area() as usize;
-        for i in 0..size {
-            let (x, y) = other.pos_of(i);
-            // New index in content
-            let k = ((y - area.y) * area.width + x - area.x) as usize;
-            self.content[k] = other.content[i].clone();
-        }
-        self.area = area;
     }
 
     /// Collects the diff between `self` and `other` into a `Vec`.
@@ -475,8 +594,8 @@ impl Buffer {
     /// Builds a minimal sequence of coordinates and Cells necessary to update the UI from
     /// self to other.
     ///
-    /// We're assuming that buffers are well-formed, that is no double-width cell is followed by
-    /// a non-blank cell.
+    /// [Continuation](Cell::is_continuation) cells are never part of the diff: the wide glyph
+    /// they belong to draws them.
     ///
     /// # Multi-width characters handling:
     ///
@@ -491,20 +610,154 @@ impl Buffer {
     /// (Index:) `01`
     /// Prev:    `a `
     /// Next:    `コ`
-    /// Updates: `0: コ` (double width symbol at index 0 - skip index 1)
+    /// Updates: `0: コ` (index 1 is a continuation)
     /// ```
     ///
     /// ```text
     /// (Index:) `012`
     /// Prev:    `aaa`
     /// Next:    `aコ`
-    /// Updates: `0: a, 1: コ` (double width symbol at index 1 - skip index 2)
+    /// Updates: `0: a, 1: コ` (index 2 is a continuation)
     /// ```
     /// # Panics
     ///
     /// Panics if the two buffers have different `x`, `y`, or `width` values.
     pub fn diff_iter<'prev, 'next>(&'prev self, other: &'next Self) -> BufferDiff<'prev, 'next> {
         BufferDiff::new(self, other)
+    }
+}
+
+/// Write access to one [`Cell`] of a [`Buffer`], from [`Buffer::cell_mut`].
+///
+/// It has the same setters as [`Cell`], and dereferences to the cell for reading. Setting a
+/// symbol also updates the neighbouring cells, so that a wide glyph always covers its
+/// continuation cells and no cell is left half-covered: see [wide glyphs](Buffer#wide-glyphs).
+/// Style setters style the whole glyph.
+///
+/// # Examples
+///
+/// ```
+/// use ratatui_core::buffer::Buffer;
+/// use ratatui_core::layout::Rect;
+/// use ratatui_core::style::Color;
+///
+/// let mut buf = Buffer::empty(Rect::new(0, 0, 3, 1));
+/// if let Some(mut cell) = buf.cell_mut((0, 0)) {
+///     cell.set_symbol("界").set_fg(Color::Red);
+/// }
+/// assert_eq!(buf[(0, 0)].symbol(), "界");
+/// assert!(buf[(1, 0)].is_continuation());
+/// ```
+#[derive(Debug)]
+pub struct CellMut<'a> {
+    buffer: &'a mut Buffer,
+    index: usize,
+}
+
+impl CellMut<'_> {
+    fn position(&self) -> Position {
+        let (x, y) = self.buffer.pos_of(self.index);
+        Position { x, y }
+    }
+
+    fn cell(&mut self) -> &mut Cell {
+        &mut self.buffer.content[self.index]
+    }
+
+    fn write(&mut self, update: impl FnOnce(&mut Cell)) -> &mut Self {
+        let position = self.position();
+        self.buffer.write(position, update);
+        self
+    }
+
+    /// Sets the symbol of the cell, keeping its style.
+    ///
+    /// A wide symbol turns the cells it covers into continuations. Writing over part of a wide
+    /// glyph removes that glyph.
+    pub fn set_symbol(&mut self, symbol: &str) -> &mut Self {
+        self.write(|cell| {
+            cell.set_symbol(symbol);
+        })
+    }
+
+    /// Sets the symbol of the cell to a single character, keeping its style.
+    ///
+    /// See [`set_symbol`](Self::set_symbol).
+    pub fn set_char(&mut self, ch: char) -> &mut Self {
+        self.write(|cell| {
+            cell.set_char(ch);
+        })
+    }
+
+    /// Sets a symbol that covers `width` columns, whatever its text says.
+    ///
+    /// Use it for symbols whose text width does not match what they draw, such as the escape
+    /// sequence of an image protocol: the image covers `width` columns, which become
+    /// continuations (up to the end of the row), so nothing else is drawn over it. Rows below
+    /// an image are not covered; use [`CellDiffOption::Skip`] there.
+    pub fn set_symbol_with_width(&mut self, symbol: &str, width: NonZeroU16) -> &mut Self {
+        self.write(|cell| {
+            cell.set_symbol(symbol).set_span(CellSpan::Fixed(width));
+        })
+    }
+
+    /// Merges `symbol` with the cell's symbol. See [`Cell::merge_symbol`].
+    pub fn merge_symbol(&mut self, symbol: &str, strategy: MergeStrategy) -> &mut Self {
+        self.write(|cell| {
+            cell.merge_symbol(symbol, strategy);
+        })
+    }
+
+    /// Replaces the whole cell.
+    ///
+    /// A [continuation](Cell::is_continuation) cell has nothing of its own to draw, so writing
+    /// one changes nothing. This lets a row of cells read from a buffer be written to another
+    /// one cell by cell.
+    pub fn set_cell(&mut self, cell: &Cell) -> &mut Self {
+        if cell.is_continuation() {
+            return self;
+        }
+        self.write(|c| c.clone_from(cell))
+    }
+
+    /// Resets the cell to a blank, unstyled cell. Writing over part of a wide glyph removes that
+    /// glyph.
+    pub fn reset(&mut self) -> &mut Self {
+        self.write(Cell::reset)
+    }
+
+    /// Sets the foreground color of the cell. See [`set_style`](Self::set_style).
+    pub fn set_fg(&mut self, color: Color) -> &mut Self {
+        self.set_style(color)
+    }
+
+    /// Sets the background color of the cell. See [`set_style`](Self::set_style).
+    pub fn set_bg(&mut self, color: Color) -> &mut Self {
+        self.set_style(Style::new().bg(color))
+    }
+
+    /// Sets the style of the cell. See [`Cell::set_style`].
+    ///
+    /// A wide glyph has one style: setting the style of its first cell sets it for the whole
+    /// glyph, and setting the style of a continuation cell does nothing.
+    pub fn set_style<S: Into<Style>>(&mut self, style: S) -> &mut Self {
+        let position = self.position();
+        self.buffer.style_glyph(position, style.into());
+        self
+    }
+
+    /// Sets the cell's [`CellDiffOption`].
+    pub fn set_diff_option(&mut self, diff_option: CellDiffOption) -> &mut Self {
+        self.cell().set_diff_option(diff_option);
+        self
+    }
+}
+
+impl Deref for CellMut<'_> {
+    type Target = Cell;
+
+    fn deref(&self) -> &Cell {
+        &self.buffer.content[self.index]
     }
 }
 
@@ -538,34 +791,6 @@ impl<P: Into<Position>> Index<P> for Buffer {
     }
 }
 
-impl<P: Into<Position>> IndexMut<P> for Buffer {
-    /// Returns a mutable reference to the [`Cell`] at the given position.
-    ///
-    /// This method accepts any value that can be converted to [`Position`] (e.g. `(x, y)` or
-    /// `Position::new(x, y)`).
-    ///
-    /// # Panics
-    ///
-    /// May panic if the given position is outside the buffer's area. For a method that returns
-    /// `None` instead of panicking, use [`Buffer::cell_mut`](Self::cell_mut).
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// use ratatui_core::buffer::{Buffer, Cell};
-    /// use ratatui_core::layout::{Position, Rect};
-    ///
-    /// let mut buf = Buffer::empty(Rect::new(0, 0, 10, 10));
-    /// buf[(0, 0)].set_symbol("A");
-    /// buf[Position::new(0, 0)].set_symbol("B");
-    /// ```
-    fn index_mut(&mut self, position: P) -> &mut Self::Output {
-        let position = position.into();
-        let index = self.index_of(position.x, position.y);
-        &mut self.content[index]
-    }
-}
-
 impl fmt::Debug for Buffer {
     /// Writes a debug representation of the buffer to the given formatter.
     ///
@@ -585,17 +810,9 @@ impl fmt::Debug for Buffer {
         let mut last_style = None;
         let mut styles = vec![];
         for (y, line) in self.content.chunks(self.area.width as usize).enumerate() {
-            let mut overwritten = vec![];
-            let mut skip: u16 = 0;
             f.write_str("        \"")?;
             for (x, c) in line.iter().enumerate() {
-                let sym = c.symbol();
-                if skip == 0 {
-                    f.write_str(sym)?;
-                } else {
-                    overwritten.push((x, sym));
-                }
-                skip = cmp::max(skip, c.cell_width()).saturating_sub(1);
+                f.write_str(c.symbol())?;
                 #[cfg(feature = "underline-color")]
                 {
                     let style = (c.fg, c.bg, c.underline_color, c.modifier);
@@ -613,13 +830,7 @@ impl fmt::Debug for Buffer {
                     }
                 }
             }
-            f.write_str("\",")?;
-            if !overwritten.is_empty() {
-                f.write_fmt(format_args!(
-                    " // hidden by multi-width symbols: {overwritten:?}"
-                ))?;
-            }
-            f.write_str("\n")?;
+            f.write_str("\",\n")?;
         }
         f.write_str("    ],\n    styles: [\n")?;
         for s in styles {
@@ -677,7 +888,7 @@ mod tests {
             Buffer {
                 area: Rect { x: 0, y: 0, width: 4, height: 1 },
                 content: [
-                    "a🦀b", // hidden by multi-width symbols: [(2, " ")]
+                    "a🦀b",
                 ],
                 styles: [
                     x: 0, y: 0, fg: Reset, bg: Reset, underline: Reset, modifier: NONE,
@@ -792,10 +1003,13 @@ mod tests {
         let mut expected = Cell::default();
         expected.set_symbol("H");
 
-        assert_eq!(buf.cell_mut((0, 0)), Some(&mut expected));
-        assert_eq!(buf.cell_mut((10, 10)), None);
-        assert_eq!(buf.cell_mut(Position::new(0, 0)), Some(&mut expected));
-        assert_eq!(buf.cell_mut(Position::new(10, 10)), None);
+        assert_eq!(buf.cell_mut((0, 0)).as_deref(), Some(&expected));
+        assert!(buf.cell_mut((10, 10)).is_none());
+        assert_eq!(
+            buf.cell_mut(Position::new(0, 0)).as_deref(),
+            Some(&expected)
+        );
+        assert!(buf.cell_mut(Position::new(10, 10)).is_none());
     }
 
     #[test]
@@ -822,25 +1036,170 @@ mod tests {
         let _ = buf[(x, y)];
     }
 
-    #[test]
-    fn index_mut() {
-        let mut buf = Buffer::with_lines(["Cat", "Dog"]);
-        buf[(0, 0)].set_symbol("B");
-        buf[Position::new(0, 1)].set_symbol("L");
-        assert_eq!(buf, Buffer::with_lines(["Bat", "Log"]));
+    /// The cells of row `y`, as a terminal shows them: symbols, with `>` for continuations.
+    fn row_view(buf: &Buffer, y: u16) -> String {
+        (buf.area.left()..buf.area.right())
+            .map(|x| &buf[(x, y)])
+            .map(|cell| {
+                if cell.is_continuation() {
+                    ">"
+                } else {
+                    cell.symbol()
+                }
+            })
+            .collect()
     }
 
-    #[rstest]
-    #[case::left(9, 10)]
-    #[case::top(10, 9)]
-    #[case::right(20, 10)]
-    #[case::bottom(10, 20)]
-    #[should_panic(
-        expected = "index outside of buffer: the area is Rect { x: 10, y: 10, width: 10, height: 10 } but index is"
-    )]
-    fn index_mut_out_of_bounds_panics(#[case] x: u16, #[case] y: u16) {
-        let mut buf = Buffer::empty(Rect::new(10, 10, 10, 10));
-        buf[(x, y)].set_symbol("A");
+    #[test]
+    fn wide_write_marks_continuations() {
+        let mut buf = Buffer::empty(Rect::new(0, 0, 5, 1));
+        buf.set_string(0, 0, "界a😀", Style::new());
+        assert_eq!(row_view(&buf, 0), "界>a😀>");
+        assert_eq!(buf[(1, 0)].symbol(), "");
+        assert_eq!(buf[(1, 0)].cell_width(), 0);
+
+        let mut buf = Buffer::empty(Rect::new(0, 0, 3, 1));
+        buf.cell_mut((0, 0)).unwrap().set_symbol("❤️");
+        assert_eq!(row_view(&buf, 0), "❤️> ");
+    }
+
+    /// Writing over the first cell of a wide glyph removes the glyph: its continuation becomes a
+    /// blank in the glyph's style.
+    #[test]
+    fn overwriting_anchor_resets_glyph() {
+        let mut buf = Buffer::empty(Rect::new(0, 0, 3, 1));
+        buf.set_string(0, 0, "界", Style::new().bg(Color::Blue));
+        buf.cell_mut((0, 0)).unwrap().set_symbol("x");
+        assert_eq!(row_view(&buf, 0), "x  ");
+        assert!(!buf[(1, 0)].is_continuation());
+        assert_eq!(buf[(1, 0)].bg, Color::Blue);
+    }
+
+    /// Writing over a continuation removes the glyph it belongs to, like a terminal does.
+    #[test]
+    fn overwriting_continuation_resets_glyph() {
+        let mut buf = Buffer::empty(Rect::new(0, 0, 3, 1));
+        buf.set_string(0, 0, "界", Style::new().bg(Color::Blue));
+        buf.cell_mut((1, 0)).unwrap().set_symbol("x");
+        assert_eq!(row_view(&buf, 0), " x ");
+        assert_eq!(buf[(0, 0)].bg, Color::Blue);
+
+        // `reset`, as used by `Clear`, does the same.
+        let mut buf = Buffer::empty(Rect::new(0, 0, 3, 1));
+        buf.set_string(0, 0, "界", Style::new());
+        buf.cell_mut((1, 0)).unwrap().reset();
+        assert_eq!(buf, Buffer::empty(Rect::new(0, 0, 3, 1)));
+    }
+
+    /// A wide glyph written across another one removes it, including its continuations past the
+    /// new glyph.
+    #[test]
+    fn wide_glyph_over_wide_glyphs() {
+        let mut buf = Buffer::empty(Rect::new(0, 0, 5, 1));
+        buf.set_string(0, 0, "界界", Style::new());
+        buf.set_string(1, 0, "漢", Style::new());
+        assert_eq!(row_view(&buf, 0), " 漢>  ");
+
+        // A narrow glyph over a narrow cell leaves its neighbours alone.
+        let mut buf = Buffer::with_lines(["界ab"]);
+        buf.set_string(2, 0, "x", Style::new());
+        assert_eq!(row_view(&buf, 0), "界>xb");
+    }
+
+    /// A wide glyph that does not fit in its row is clipped: it covers the columns that are left
+    /// and says so, and never covers a cell of the next row.
+    #[test]
+    fn wide_glyph_clipped_at_row_end() {
+        let mut buf = Buffer::empty(Rect::new(0, 0, 3, 2));
+        buf.cell_mut((2, 0)).unwrap().set_symbol("界");
+        assert_eq!(buf[(2, 0)].symbol(), "界");
+        assert_eq!(buf[(2, 0)].cell_width(), 1);
+        assert!(!buf[(0, 1)].is_continuation());
+
+        let mut buf = Buffer::empty(Rect::new(0, 0, 5, 1));
+        let width = NonZeroU16::new(3).unwrap();
+        buf.cell_mut((1, 0))
+            .unwrap()
+            .set_symbol_with_width("\x1b[s", width);
+        assert_eq!(row_view(&buf, 0), " \x1b[s>> ");
+        assert_eq!(buf[(1, 0)].cell_width(), 3);
+        buf.cell_mut((3, 0))
+            .unwrap()
+            .set_symbol_with_width("\x1b[s", width);
+        assert_eq!(row_view(&buf, 0), "   \x1b[s>");
+        assert_eq!(buf[(3, 0)].cell_width(), 2);
+    }
+
+    /// A wide glyph has one style: styling its first cell styles the glyph, styling its
+    /// continuation does nothing.
+    #[test]
+    fn wide_glyph_has_one_style() {
+        let mut buf = Buffer::empty(Rect::new(0, 0, 3, 1));
+        buf.set_string(0, 0, "界", Style::new());
+        buf.cell_mut((0, 0)).unwrap().set_bg(Color::Red);
+        assert_eq!(buf[(1, 0)].bg, Color::Red);
+        buf.cell_mut((1, 0)).unwrap().set_bg(Color::Blue);
+        assert_eq!(buf[(1, 0)].bg, Color::Red);
+
+        // An area that starts in the middle of the glyph leaves it alone.
+        buf.set_style(Rect::new(1, 0, 2, 1), Style::new().bg(Color::Green));
+        assert_eq!((buf[(0, 0)].bg, buf[(1, 0)].bg), (Color::Red, Color::Red));
+        assert_eq!(buf[(2, 0)].bg, Color::Green);
+        // An area that ends in the middle of the glyph styles all of it.
+        buf.set_style(Rect::new(0, 0, 1, 1), Style::new().bg(Color::Yellow));
+        assert_eq!(
+            (buf[(0, 0)].bg, buf[(1, 0)].bg),
+            (Color::Yellow, Color::Yellow)
+        );
+    }
+
+    /// Copying a row cell by cell copies its wide glyphs whole: writing a continuation is a
+    /// no-op, the glyph before it already wrote it.
+    #[test]
+    fn set_cell_copies_wide_glyphs() {
+        let source = Buffer::with_lines(["a界b😀"]);
+        let mut copy = Buffer::with_lines(["xxxxxx"]);
+        for (position, cell) in source.area.positions().zip(source.content()) {
+            copy.cell_mut(position).unwrap().set_cell(cell);
+        }
+        assert_eq!(copy, source);
+
+        let mut buf = Buffer::with_lines(["xyz"]);
+        buf.cell_mut((1, 0)).unwrap().set_cell(&source[(2, 0)]);
+        assert_eq!(buf, Buffer::with_lines(["xyz"]));
+    }
+
+    #[test]
+    fn merge_keeps_wide_glyphs_whole() {
+        let mut buf = Buffer::with_lines(["界界"]);
+        let mut other = Buffer::empty(Rect::new(1, 0, 2, 1));
+        other.set_string(1, 0, "ab", Style::new());
+        buf.merge(&other);
+        assert_eq!(row_view(&buf, 0), " ab ");
+    }
+
+    #[test]
+    fn resize_clips_wide_glyph() {
+        let mut buf = Buffer::with_lines(["a界", "界b"]);
+        buf.resize(Rect::new(0, 0, 2, 2));
+        assert_eq!(row_view(&buf, 0), "a界");
+        assert_eq!(buf[(1, 0)].cell_width(), 1);
+        assert_eq!(row_view(&buf, 1), "界>");
+    }
+
+    #[test]
+    fn filled_with_wide_cell() {
+        let buf = Buffer::filled(Rect::new(0, 0, 5, 2), Cell::new("界"));
+        assert_eq!(row_view(&buf, 0), "界>界>界");
+        assert_eq!(row_view(&buf, 1), "界>界>界");
+    }
+
+    #[test]
+    fn cell_mut_writes() {
+        let mut buf = Buffer::with_lines(["Cat", "Dog"]);
+        buf.cell_mut((0, 0)).unwrap().set_symbol("B");
+        buf.cell_mut(Position::new(0, 1)).unwrap().set_char('L');
+        assert_eq!(buf, Buffer::with_lines(["Bat", "Log"]));
     }
 
     #[test]
@@ -934,34 +1293,35 @@ mod tests {
         // Halfwidth katakana + non-combining dakuten (U+FF9E): grapheme cluster takes 2 cells
         let mut buffer = Buffer::empty(area);
         buffer.set_string(0, 0, "ｶﾞ", Style::default());
-        // The whole grapheme cluster "ｶﾞ" is placed in cell[0], and cell[1] is reset (width=2)
+        // The whole grapheme cluster "ｶﾞ" is placed in cell[0], and cell[1] is its continuation
+        // (width=2)
         assert_eq!(buffer.content[0].symbol(), "ｶﾞ");
-        assert_eq!(buffer.content[1].symbol(), " "); // reset cell
+        assert!(buffer.content[1].is_continuation());
         assert_eq!(buffer.content[2].symbol(), " ");
 
         // Halfwidth katakana + non-combining handakuten (U+FF9F): grapheme cluster takes 2 cells
         let mut buffer = Buffer::empty(area);
         buffer.set_string(0, 0, "ﾊﾟ", Style::default());
         assert_eq!(buffer.content[0].symbol(), "ﾊﾟ");
-        assert_eq!(buffer.content[1].symbol(), " "); // reset cell
+        assert!(buffer.content[1].is_continuation());
         assert_eq!(buffer.content[2].symbol(), " ");
 
         // Multiple halfwidth katakana with dakuten: each cluster takes 2 cells (4 total)
         let mut buffer = Buffer::empty(area);
         buffer.set_string(0, 0, "ｶﾞｷﾞ", Style::default());
         assert_eq!(buffer.content[0].symbol(), "ｶﾞ"); // first cluster: width 2
-        assert_eq!(buffer.content[1].symbol(), " "); // reset by first cluster
+        assert!(buffer.content[1].is_continuation());
         assert_eq!(buffer.content[2].symbol(), "ｷﾞ"); // second cluster: width 2
-        assert_eq!(buffer.content[3].symbol(), " "); // reset by second cluster
+        assert!(buffer.content[3].is_continuation());
         assert_eq!(buffer.content[4].symbol(), " ");
 
         // Overflow: only first 2 grapheme clusters fit (4 cells out of 5)
         let mut buffer = Buffer::empty(area);
         buffer.set_string(0, 0, "ｶﾞｷﾞｸﾞ", Style::default());
         assert_eq!(buffer.content[0].symbol(), "ｶﾞ");
-        assert_eq!(buffer.content[1].symbol(), " ");
+        assert!(buffer.content[1].is_continuation());
         assert_eq!(buffer.content[2].symbol(), "ｷﾞ");
-        assert_eq!(buffer.content[3].symbol(), " ");
+        assert!(buffer.content[3].is_continuation());
         assert_eq!(buffer.content[4].symbol(), " ");
     }
 
@@ -1202,8 +1562,7 @@ mod tests {
         let mut next = Buffer::empty(Rect::new(0, 0, 3, 1));
         next.cell_mut((0, 0))
             .unwrap()
-            .set_symbol("456")
-            .set_diff_option(CellDiffOption::ForcedWidth(NonZeroU16::new(3).unwrap()));
+            .set_symbol_with_width("456", NonZeroU16::new(3).unwrap());
         prev.merge(&next);
 
         let diff = prev.diff(&next);
@@ -1215,10 +1574,10 @@ mod tests {
         let mut prev = Buffer::with_lines(["_".repeat(4)]);
         let mut next = Buffer::empty(Rect::new(0, 0, 4, 1));
         // Squeeze everything into the first cell, remaining cells are irrelevant.
-        next.cell_mut((0, 0))
-            .unwrap()
-            .set_symbol("\x1b]8;;http://example.com\x1b\\link\x1b]8;;\x1b\\")
-            .set_diff_option(CellDiffOption::ForcedWidth(NonZeroU16::new(4).unwrap()));
+        next.cell_mut((0, 0)).unwrap().set_symbol_with_width(
+            "\x1b]8;;http://example.com\x1b\\link\x1b]8;;\x1b\\",
+            NonZeroU16::new(4).unwrap(),
+        );
         prev.merge(&next);
 
         let diff = prev.diff(&next);
@@ -1230,10 +1589,10 @@ mod tests {
         let mut prev = Buffer::with_lines(["_".repeat(8)]);
         let mut next = Buffer::empty(Rect::new(0, 0, 8, 1));
         // Squeeze starting sequence and first character in first cell.
-        next.cell_mut((0, 0))
-            .unwrap()
-            .set_symbol("\x1b]8;;http://example.com\x1b\\🔗")
-            .set_diff_option(CellDiffOption::ForcedWidth(NonZeroU16::new(2).unwrap()));
+        next.cell_mut((0, 0)).unwrap().set_symbol_with_width(
+            "\x1b]8;;http://example.com\x1b\\🔗",
+            NonZeroU16::new(2).unwrap(),
+        );
         // Set inner characters normally.
         next.cell_mut((2, 0)).unwrap().set_symbol("l");
         next.cell_mut((3, 0)).unwrap().set_symbol("i");
@@ -1242,8 +1601,7 @@ mod tests {
         // Squeeze closing part into last cell.
         next.cell_mut((7, 0))
             .unwrap()
-            .set_symbol("🔗\x1b]8;;\x1b\\")
-            .set_diff_option(CellDiffOption::ForcedWidth(NonZeroU16::new(2).unwrap()));
+            .set_symbol_with_width("🔗\x1b]8;;\x1b\\", NonZeroU16::new(2).unwrap());
         prev.merge(&next);
 
         let diff = prev.diff(&next);
@@ -1271,8 +1629,7 @@ mod tests {
 
         prev.cell_mut((0, 0))
             .unwrap()
-            .set_symbol(&kitty_image_placeholder_start)
-            .set_diff_option(CellDiffOption::ForcedWidth(NonZeroU16::new(1).unwrap()));
+            .set_symbol_with_width(&kitty_image_placeholder_start, NonZeroU16::new(1).unwrap());
 
         // Add two follow up placeholder symbols that have a natural width of 1.
         prev.cell_mut((1, 0)).unwrap().set_char('\u{10EEEE}');
@@ -1281,8 +1638,7 @@ mod tests {
         // force the width again to 1 to avoid skipping the next cell.
         prev.cell_mut((3, 0))
             .unwrap()
-            .set_symbol("\u{10EEEE}\x1b[u")
-            .set_diff_option(CellDiffOption::ForcedWidth(NonZeroU16::new(1).unwrap()));
+            .set_symbol_with_width("\u{10EEEE}\x1b[u", NonZeroU16::new(1).unwrap());
 
         let mut buffer = Buffer::filled(Rect::new(0, 0, 20, 1), Cell::new("x"));
         buffer.merge(&prev);
@@ -1536,28 +1892,21 @@ mod tests {
     /// 2. A border with VS16 emojis (like ⚠️) was rendered on top
     /// 3. The trailing cells had different styles but the same symbol (space)
     ///
-    /// The fix ensures that only symbol changes trigger trailing cell updates,
-    /// not style-only changes, since the style of hidden trailing cells is not visible.
+    /// Only a column that shows something on a blank (a symbol, a background, ...) is cleared
+    /// before the emoji is drawn; a foreground color on a blank is not visible.
     #[test]
     fn diff_ignores_style_only_changes_in_trailing_cells() {
         use crate::style::Color;
 
         // Previous buffer: spaces with specific fg color
         let mut prev = Buffer::empty(Rect::new(0, 0, 3, 1));
-        prev.content[0].set_symbol(" ");
-        prev.content[0].set_fg(Color::LightBlue); // <-- style A
-        prev.content[1].set_symbol(" ");
-        prev.content[1].set_fg(Color::LightBlue);
-        prev.content[2].set_symbol("x");
+        prev.set_string(0, 0, "  ", Style::new().fg(Color::LightBlue)); // <-- style A
+        prev.set_string(2, 0, "x", Style::new());
 
-        // Next buffer: emoji but DIFFERENT style on main cell,
-        // trailing cell has same symbol but different style
+        // Next buffer: emoji with a DIFFERENT style; its second column is a continuation
         let mut next = Buffer::empty(Rect::new(0, 0, 3, 1));
-        next.content[0].set_symbol("⚠️"); // emoji symbol
-        next.content[0].set_fg(Color::Reset); // <-- style B (DIFFERENT from prev!)
-        next.content[1].set_symbol(" "); // same symbol (space), trailing cell (hidden by emoji)
-        next.content[1].set_fg(Color::Reset);
-        next.content[2].set_symbol("x");
+        next.set_string(0, 0, "⚠️", Style::new()); // <-- style B (DIFFERENT from prev!)
+        next.set_string(2, 0, "x", Style::new());
 
         let diff = prev.diff(&next);
 

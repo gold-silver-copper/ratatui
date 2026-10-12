@@ -29,7 +29,7 @@ fn widgets_block_renders() {
         "          ",
     ]);
     for x in 1..=5 {
-        expected[(x, 0)].set_fg(Color::LightBlue);
+        expected.cell_mut((x, 0)).unwrap().set_fg(Color::LightBlue);
     }
     terminal.backend().assert_buffer(&expected);
 }

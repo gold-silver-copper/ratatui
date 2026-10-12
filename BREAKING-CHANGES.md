@@ -11,6 +11,8 @@ GitHub with a [breaking change] label.
 This is a quick summary of the sections below:
 
 - [v0.31.0](#v0310)
+  - `Buffer` no longer implements `IndexMut`; `Buffer::cell_mut` returns a `CellMut`
+  - `CellDiffOption::ForcedWidth` is replaced by `CellMut::set_symbol_with_width`
   - `Backend` adds cursor save and restore methods
 - [v0.30.1](#v0301)
   - Adding `AsRef` impls for widgets may affect type inference in rare cases
@@ -100,6 +102,65 @@ This is a quick summary of the sections below:
   - `List` no longer ignores empty strings
 
 ## v0.31.0
+
+### `Buffer` no longer implements `IndexMut`; `Buffer::cell_mut` returns a `CellMut`
+
+A wide glyph such as `界` is stored in the cell where it starts, and the other columns it covers
+are now explicit continuation cells (`Cell::is_continuation`). The buffer keeps them consistent on
+every write, so it no longer hands out `&mut Cell`. `Buffer[pos]` still works for reading; to write
+a cell, use `Buffer::cell_mut`, which returns `Option<CellMut>` with the same setters as `Cell`:
+
+```diff
+- buf[(x, y)].set_symbol("x").set_style(style);
++ if let Some(mut cell) = buf.cell_mut((x, y)) {
++     cell.set_symbol("x").set_style(style);
++ }
+```
+
+```diff
+- buf[(x, y)] = cell;
++ if let Some(mut dest) = buf.cell_mut((x, y)) {
++     dest.set_cell(&cell);
++ }
+```
+
+```diff
+- buf[(x, y)].modifier.insert(Modifier::DIM);
+- buf[(x, y)].bg = Color::Black;
++ if let Some(mut cell) = buf.cell_mut((x, y)) {
++     cell.set_style(Style::new().bg(Color::Black).add_modifier(Modifier::DIM));
++ }
+```
+
+`Buffer::content` is no longer a public field; read the cells with `Buffer::content()`. The
+deprecated `Buffer::get_mut` is removed.
+
+Behavior changes that come with the new model:
+
+- Writing over any part of a wide glyph removes the whole glyph, as in a terminal; its other cells
+  become blanks that keep their style.
+- A wide glyph has one style: styling its first cell styles the continuation cells too, and styling
+  a continuation cell does nothing.
+- A continuation cell's `symbol()` is `""` and its `cell_width()` is 0. `BufferDiff` never yields
+  one, so backends do not need to work out which cells a wide glyph covers.
+
+### `CellDiffOption::ForcedWidth` is replaced by `CellMut::set_symbol_with_width`
+
+A symbol that covers more columns than its text says (an image protocol escape sequence, for
+example) declares its width when it is written, and the columns it covers become continuation
+cells:
+
+```diff
+- buf[(x, y)]
+-     .set_symbol(&sequence)
+-     .set_diff_option(CellDiffOption::ForcedWidth(width));
++ if let Some(mut cell) = buf.cell_mut((x, y)) {
++     cell.set_symbol_with_width(&sequence, width);
++ }
+```
+
+Continuation cells stop at the end of the row; rows below an image still need
+`CellDiffOption::Skip`.
 
 ### `Backend` adds cursor save and restore methods
 

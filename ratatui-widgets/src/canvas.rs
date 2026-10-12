@@ -902,7 +902,9 @@ where
                     (index % width) as u16 + canvas_area.left(),
                     (index / width) as u16 + canvas_area.top(),
                 );
-                let cell = &mut buf[(x, y)];
+                let Some(mut cell) = buf.cell_mut((x, y)) else {
+                    continue;
+                };
 
                 if let Some(symbol) = layer_cell.symbol {
                     cell.set_char(symbol);

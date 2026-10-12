@@ -4,7 +4,7 @@ use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 use core::cmp::min;
 
-use ratatui_core::buffer::{Buffer, Cell};
+use ratatui_core::buffer::{Buffer, CellMut};
 use ratatui_core::layout::Rect;
 use ratatui_core::style::{Style, Styled};
 use ratatui_core::symbols::braille::BRAILLE;
@@ -472,8 +472,9 @@ impl Sparkline<'_> {
                 for j in 0..spark_area.height {
                     let y = spark_area.top() + spark_area.height - 1 - j;
                     let ticks = Self::cell_ticks(total_ticks, j, sub_rows);
-                    let cell = &mut buf[(x, y)];
-                    self.set_single_width_cell(cell, ticks, style);
+                    if let Some(mut cell) = buf.cell_mut((x, y)) {
+                        self.set_single_width_cell(&mut cell, ticks, style);
+                    }
                 }
             } else {
                 self.render_absent_column(x, spark_area, buf);
@@ -484,13 +485,14 @@ impl Sparkline<'_> {
     fn render_absent_column(&self, x: u16, spark_area: Rect, buf: &mut Buffer) {
         let style = self.style.patch(self.absent_value_style);
         for y in spark_area.top()..spark_area.bottom() {
-            buf[(x, y)]
-                .set_symbol(&self.absent_value_symbol.0)
-                .set_style(style);
+            if let Some(mut cell) = buf.cell_mut((x, y)) {
+                cell.set_symbol(&self.absent_value_symbol.0)
+                    .set_style(style);
+            }
         }
     }
 
-    fn set_single_width_cell(&self, cell: &mut Cell, ticks: u16, style: Style) {
+    fn set_single_width_cell(&self, cell: &mut CellMut<'_>, ticks: u16, style: Style) {
         match self.marker {
             Marker::HalfBlock => {
                 let ch = match ticks {
@@ -586,9 +588,10 @@ impl Sparkline<'_> {
                 let pattern = Self::column_pattern(cell_ticks_left, sub_rows, 0)
                     | Self::column_pattern(cell_ticks_right, sub_rows, 1);
 
-                buf[(x, y)]
-                    .set_char(pixel_table[usize::from(pattern)])
-                    .set_style(cell_style);
+                if let Some(mut cell) = buf.cell_mut((x, y)) {
+                    cell.set_char(pixel_table[usize::from(pattern)])
+                        .set_style(cell_style);
+                }
             }
         }
     }
@@ -1030,7 +1033,7 @@ mod tests {
             .max(4);
         let buffer = render(widget, 2);
         let mut expected = Buffer::with_lines(["⣿x"]);
-        expected[(0, 0)].set_fg(Color::Blue);
+        expected.cell_mut((0, 0)).unwrap().set_fg(Color::Blue);
 
         assert_eq!(buffer, expected);
     }
@@ -1070,7 +1073,7 @@ mod tests {
             .data([None, None]);
         let buffer = render(widget, 1);
         let mut expected = Buffer::with_lines([" "]);
-        expected[(0, 0)].set_fg(Color::Yellow);
+        expected.cell_mut((0, 0)).unwrap().set_fg(Color::Yellow);
 
         assert_eq!(buffer, expected);
     }
@@ -1090,8 +1093,8 @@ mod tests {
             .max(4);
         let buffer = render(widget, 3);
         let mut expected = Buffer::with_lines(["⡇⢸x"]);
-        expected[(0, 0)].set_fg(Color::Red);
-        expected[(1, 0)].set_fg(Color::Blue);
+        expected.cell_mut((0, 0)).unwrap().set_fg(Color::Red);
+        expected.cell_mut((1, 0)).unwrap().set_fg(Color::Blue);
 
         assert_eq!(buffer, expected);
     }
@@ -1117,7 +1120,7 @@ mod tests {
             .max(4);
         let buffer = render(widget, 2);
         let mut expected = Buffer::with_lines([line]);
-        expected[(1, 0)].set_fg(color);
+        expected.cell_mut((1, 0)).unwrap().set_fg(color);
 
         assert_eq!(buffer, expected);
     }

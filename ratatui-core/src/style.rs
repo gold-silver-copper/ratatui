@@ -189,7 +189,7 @@ impl fmt::Debug for Modifier {
 /// ];
 /// let mut buffer = Buffer::empty(Rect::new(0, 0, 1, 1));
 /// for style in &styles {
-///     buffer[(0, 0)].set_style(*style);
+///     buffer.set_style(buffer.area, *style);
 /// }
 /// assert_eq!(
 ///     Style {
@@ -220,7 +220,7 @@ impl fmt::Debug for Modifier {
 /// ];
 /// let mut buffer = Buffer::empty(Rect::new(0, 0, 1, 1));
 /// for style in &styles {
-///     buffer[(0, 0)].set_style(*style);
+///     buffer.set_style(buffer.area, *style);
 /// }
 /// assert_eq!(
 ///     Style {
@@ -767,8 +767,11 @@ mod tests {
         let mut buffer = Buffer::empty(Rect::new(0, 0, 1, 1));
 
         for m in mods {
-            buffer[(0, 0)].set_style(Style::reset());
-            buffer[(0, 0)].set_style(Style::new().add_modifier(m));
+            buffer.cell_mut((0, 0)).unwrap().set_style(Style::reset());
+            buffer
+                .cell_mut((0, 0))
+                .unwrap()
+                .set_style(Style::new().add_modifier(m));
             let style = buffer[(0, 0)].style();
             assert!(style.add_modifier.contains(m));
             assert!(!style.sub_modifier.contains(m));

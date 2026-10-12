@@ -93,7 +93,7 @@ fn all_styles_combine() {
     let mut expected = Buffer::with_lines(["┌──┐", "│hi│", "└──┘"]);
     expected.set_style(expected.area, Style::new().italic().blue().on_green());
     let inner = Style::new().red().on_green().italic().bold().underlined();
-    expected[(1, 1)].set_style(inner);
-    expected[(2, 1)].set_style(inner);
+    expected.cell_mut((1, 1)).unwrap().set_style(inner);
+    expected.cell_mut((2, 1)).unwrap().set_style(inner);
     assert_eq!(buffer, expected);
 }

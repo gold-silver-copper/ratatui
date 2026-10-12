@@ -474,7 +474,9 @@ impl Rect {
     /// fn render_positions(area: Rect, buf: &mut Buffer) {
     ///     // Renders position indices (0-9 repeating) at each cell position
     ///     for (i, position) in area.positions().enumerate() {
-    ///         buf[position].set_symbol(&format!("{}", i % 10));
+    ///         if let Some(mut cell) = buf.cell_mut(position) {
+    ///             cell.set_symbol(&format!("{}", i % 10));
+    ///         }
     ///     }
     /// }
     /// ```

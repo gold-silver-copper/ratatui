@@ -43,7 +43,9 @@ impl Widget for &Clear {
         }
         for x in area.left()..area.right() {
             for y in area.top()..area.bottom() {
-                buf[(x, y)].reset();
+                if let Some(mut cell) = buf.cell_mut((x, y)) {
+                    cell.reset();
+                }
             }
         }
     }

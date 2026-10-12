@@ -13,9 +13,9 @@ const HALFWIDTH_KATAKANA_SEMI_VOICED_SOUND_MARK: char = '\u{FF9F}';
 /// - **`str`**: width is derived from [`UnicodeWidthStr`], with a fast path for single-byte ASCII
 ///   characters and a terminal-compatibility adjustment for halfwidth katakana dakuten/handakuten
 ///   (`U+FF9E`/`U+FF9F`).
-/// - **[`Cell`](super::Cell)**: returns the
-///   [`CellDiffOption::ForcedWidth`](super::CellDiffOption::ForcedWidth) when set, otherwise falls
-///   back to the width of the cell's symbol.
+/// - **[`Cell`](super::Cell)**: returns the number of columns the cell's glyph covers: a declared
+///   width when the cell has one, zero for a continuation cell, otherwise the width of the cell's
+///   symbol.
 pub trait CellWidth {
     /// Returns the display width in terminal cells.
     fn cell_width(&self) -> u16;

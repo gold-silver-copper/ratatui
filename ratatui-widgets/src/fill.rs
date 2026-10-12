@@ -115,7 +115,9 @@ impl Widget for &Fill<'_> {
             return;
         }
         for position in area.positions() {
-            buf[position].set_symbol(&self.symbol).set_style(self.style);
+            if let Some(mut cell) = buf.cell_mut(position) {
+                cell.set_symbol(&self.symbol).set_style(self.style);
+            }
         }
     }
 }
@@ -157,7 +159,7 @@ mod tests {
             "     ",
         ]);
         for x in 1..=3 {
-            expected[(x, 1)].set_style(Style::new().fg(Color::Red));
+            expected.cell_mut((x, 1)).unwrap().set_style(Style::new().fg(Color::Red));
         }
         assert_eq!(buffer, expected);
     }
@@ -185,7 +187,7 @@ mod tests {
         let mut expected = Buffer::empty(Rect::new(2, 2, 2, 2));
         for y in 2..4 {
             for x in 2..4 {
-                expected[(x, y)].set_symbol("#");
+                expected.cell_mut((x, y)).unwrap().set_symbol("#");
             }
         }
         assert_eq!(buffer, expected);
@@ -201,7 +203,10 @@ mod tests {
             .render(Rect::new(0, 0, 2, 1), &mut buffer);
         let mut expected = Buffer::with_lines(["**"]);
         for x in 0..2 {
-            expected[(x, 0)].set_style(Style::new().fg(Color::Blue).bold());
+            expected
+                .cell_mut((x, 0))
+                .unwrap()
+                .set_style(Style::new().fg(Color::Blue).bold());
         }
         assert_eq!(buffer, expected);
     }

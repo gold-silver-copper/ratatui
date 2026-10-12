@@ -673,7 +673,7 @@ fn widgets_table_can_have_elements_styled_individually() {
     ]);
     // First row = row color + highlight style
     for col in 1..=28 {
-        expected[(col, 2)].set_style(
+        expected.cell_mut((col, 2)).unwrap().set_style(
             Style::default()
                 .fg(Color::Green)
                 .add_modifier(Modifier::BOLD),
@@ -683,30 +683,48 @@ fn widgets_table_can_have_elements_styled_individually() {
     // Second column highlight style
     for row in 2..=3 {
         for col in 11..=16 {
-            expected[(col, row)].set_style(Style::default().add_modifier(Modifier::ITALIC));
+            expected
+                .cell_mut((col, row))
+                .unwrap()
+                .set_style(Style::default().add_modifier(Modifier::ITALIC));
         }
     }
 
     // First row, second column highlight style (cell highlight)
     for col in 11..=16 {
-        expected[(col, 2)].set_style(Style::default().add_modifier(Modifier::DIM));
+        expected
+            .cell_mut((col, 2))
+            .unwrap()
+            .set_style(Style::default().add_modifier(Modifier::DIM));
     }
 
     // Second row:
     // 1. row color
     for col in 1..=28 {
-        expected[(col, 3)].set_style(Style::default().fg(Color::LightGreen));
+        expected
+            .cell_mut((col, 3))
+            .unwrap()
+            .set_style(Style::default().fg(Color::LightGreen));
     }
     // 2. cell color
     for col in 11..=16 {
-        expected[(col, 3)].set_style(Style::default().fg(Color::Yellow));
+        expected
+            .cell_mut((col, 3))
+            .unwrap()
+            .set_style(Style::default().fg(Color::Yellow));
     }
     for col in 18..=23 {
-        expected[(col, 3)].set_style(Style::default().fg(Color::Red));
+        expected
+            .cell_mut((col, 3))
+            .unwrap()
+            .set_style(Style::default().fg(Color::Red));
     }
     // 3. text color
     for col in 21..=22 {
-        expected[(col, 3)].set_style(Style::default().fg(Color::Blue));
+        expected
+            .cell_mut((col, 3))
+            .unwrap()
+            .set_style(Style::default().fg(Color::Blue));
     }
     terminal.backend().assert_buffer(&expected);
 }

@@ -580,10 +580,6 @@ impl fmt::Display for ResetRegion {
 
 #[cfg(test)]
 mod tests {
-    use std::num::NonZeroU16;
-
-    use ratatui_core::buffer::CellDiffOption;
-
     use super::*;
 
     /// Renders `content` and returns the emitted bytes as a lossy string.
@@ -635,10 +631,10 @@ mod tests {
 
     #[test]
     fn draw_moves_cursor_when_previous_width_overflows() {
-        let mut forced = Cell::new("a");
-        forced.set_diff_option(CellDiffOption::ForcedWidth(NonZeroU16::MAX));
+        // A wide glyph at the last representable column: its end overflows u16.
+        let wide = Cell::new("界");
         let next = Cell::new("b");
-        let output = draw_to_string(&[(1, 0, &forced), (0, 0, &next)]);
+        let output = draw_to_string(&[(u16::MAX - 1, 0, &wide), (0, 0, &next)]);
         assert!(output.contains(&termion::cursor::Goto(1, 1).to_string()));
     }
 
